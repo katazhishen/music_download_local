@@ -199,14 +199,14 @@ def search_kugou(query: str, platform: str = "kugou", page: int = 1) -> dict:
                 "id": item.get("hash", ""),
                 "title": item.get("songname", "Unknown"),
                 "artist": item.get("singername", "Unknown"),
-                "cover": "",
+                "cover": item.get("imgUrl", "") or "",  # may be empty, frontend will retry
                 "lyric": "",
                 "url": "",
                 "link": f"https://www.kugou.com/song/#hash={item.get('hash','')}",
                 "platform": "kugou",
                 "platform_name": "酷狗",
                 "source": "kugou",
-                "filename": item.get("filename", ""),  # e.g. "周杰伦 - 晴天"
+                "filename": item.get("filename", ""),
             })
         total = data.get("data", {}).get("total", len(songs))
         return {"songs": songs, "total": total, "error": None}
@@ -390,29 +390,36 @@ def api_search():
 
 @app.route("/api/song/<platform>/<song_id>")
 def api_song_detail(platform, song_id):
-    """Get song detail — try xmsj.org first, then direct API."""
-    # For now, search by ID via xmsj
-    try:
-        resp = req.post(
-            XMSJ_URL,
-            data={"input": song_id, "filter": "id", "type": platform, "page": 1},
-            headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest", "Referer": XMSJ_URL},
-            timeout=15,
-        )
-        data = resp.json()
-        if data.get("code") == 200 and data.get("data"):
-            item = data["data"][0]
+    """Get song detail with cover URL. Cross-searches NetEase if needed."""
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+
+    # For netease: direct API
+    if platform == "netease":
+        detail = api.get_song_detail_sync(song_id)
+        if detail:
             return jsonify({
-                "id": str(item.get("songid", "")),
-                "title": item.get("title", "Unknown"),
-                "artist": item.get("author", "Unknown"),
-                "cover": item.get("pic", ""),
-                "lyric": item.get("lrc", ""),
-                "url": item.get("url", ""),
-                "link": item.get("link", ""),
+                "id": detail.song_id, "title": detail.title, "artist": detail.artist,
+                "cover": detail.cover_url, "lyric": "", "url": "",
+                "link": f"https://music.163.com/#/song?id={detail.song_id}",
             })
-    except Exception:
-        pass
+
+    # For qq/kugou: cross-search netease for cover
+    if title:
+        try:
+            search_q = f"{title} {artist}" if artist else title
+            result = api.search_sync(search_q, limit=3)
+            if result.songs:
+                for ns in result.songs:
+                    detail = api.get_song_detail_sync(ns.song_id)
+                    if detail and detail.cover_url:
+                        return jsonify({
+                            "id": song_id, "title": title, "artist": artist,
+                            "cover": detail.cover_url, "lyric": "", "url": "",
+                            "link": "",
+                        })
+        except Exception:
+            pass
 
     # Fallback to direct NetEase API
     if platform == "netease":

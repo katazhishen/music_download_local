@@ -291,7 +291,13 @@ function esc(s) { const d=document.createElement('div'); d.textContent=s||''; re
 // Auto-retry broken covers — fetch from detail API as fallback
 const coverRetryMap = {};
 async function retryCover(img, songId, platform) {
-  await fetchCoverForSong(songId, platform);
+  // Try to get title/artist from the song row
+  const row = img.closest('.song-row');
+  const titleEl = row?.querySelector('.title');
+  const metaEl = row?.querySelector('.meta');
+  const title = titleEl?.textContent?.trim() || '';
+  const artist = metaEl?.textContent?.trim() || '';
+  await fetchCoverForSong(songId, platform, title, artist);
   const key = songId + '@' + platform;
   if (coverRetryMap[key] && coverRetryMap[key] !== 'failed') {
     img.src = coverRetryMap[key];
@@ -370,21 +376,22 @@ function renderSongs(songs) {
   // Auto-fetch missing covers for all songs
   songs.forEach(s => {
     if (!s.cover || !s.cover.startsWith('http')) {
-      fetchCoverForSong(s.id, s.platform);
+      fetchCoverForSong(s.id, s.platform, s.title, s.artist);
     }
   });
 }
 
 // Fetch and set cover for a song
-async function fetchCoverForSong(songId, platform) {
+async function fetchCoverForSong(songId, platform, title, artist) {
   const key = songId + '@' + platform;
   if (coverRetryMap[key]) return;
   try {
-    const resp = await fetch(`/api/song/${platform}/${songId}`);
+    let url = `/api/song/${platform}/${songId}`;
+    if (title) url += `?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist||'')}`;
+    const resp = await fetch(url);
     const d = await resp.json();
     if (d.cover && d.cover.startsWith('http')) {
       coverRetryMap[key] = d.cover;
-      // Update all imgs for this song
       document.querySelectorAll(`[id=\"song-${songId}\"] .song-cover`).forEach(img => {
         img.src = d.cover;
         img.onerror = null;
