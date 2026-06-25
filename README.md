@@ -1,7 +1,10 @@
 # music_download_local
 音乐下载器本地化部署
 
-请先下载下“flask”设置本地服务器❤
+请先下载python的“flask”设置本地服务器❤
+<img width="707" height="95" alt="1f47ea8983db5f592cfa1f67ba4607e1" src="https://github.com/user-attachments/assets/717362f2-f395-4d8e-b16f-1d85214bac61" />
+
+运行 最后一句
 
 点击“启动下载器.bat”启动，自动打开网址启动
 （ps:若启动失败，按住ctrl+鼠标点击网址，手动打开
