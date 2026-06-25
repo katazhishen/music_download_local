@@ -27,16 +27,50 @@ set PYTHONPATH=%PKG_DIR%
 
 :: check and auto-install dependencies
 echo Checking dependencies...
-%PY% -c "import flask" >nul 2>&1
+set DEPS=flask requests mutagen pycryptodomex beautifulsoup4 lxml aiohttp
+%PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+if not errorlevel 1 goto deps_ok
+
+echo.
+echo ==========================================
+echo   Missing dependencies! Auto installing...
+echo   This may take 1-2 minutes on first run.
+echo ==========================================
+echo.
+
+:: Try project folder first (D drive)
+echo [1/2] Installing to project folder...
+%PY% -m pip install %DEPS% --target="%PKG_DIR%" --disable-pip-version-check
 if errorlevel 1 (
-    echo Installing dependencies to project folder...
-    %PY% -m pip install flask requests mutagen pycryptodomex beautifulsoup4 lxml --target="%PKG_DIR%" -q --disable-pip-version-check >nul 2>&1
-    if errorlevel 1 (
-        echo Trying default install location...
-        %PY% -m pip install flask requests mutagen pycryptodomex beautifulsoup4 lxml -q --disable-pip-version-check >nul 2>&1
-    )
-    echo Dependencies installed!
+    echo.
+    echo [2/2] Project folder failed, installing to system...
+    %PY% -m pip install %DEPS% --disable-pip-version-check
 )
+
+:: Verify installation worked
+set PYTHONPATH=%PKG_DIR%
+%PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ==========================================
+    echo   Install FAILED! Trying system-wide...
+    echo ==========================================
+    %PY% -m pip install %DEPS% --user --disable-pip-version-check
+    %PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo FATAL: Cannot install dependencies!
+        echo Please run manually:
+        echo   %PY% -m pip install %DEPS%
+        echo.
+        pause
+        exit /b 1
+    )
+)
+echo OK! All dependencies ready.
+echo.
+
+:deps_ok
 
 :: add firewall rule (needs admin, ignore errors)
 netsh advfirewall firewall add rule name="MusicDownloader" dir=in action=allow protocol=TCP localport=%PORT% >nul 2>&1
