@@ -13,12 +13,17 @@ import os, sys, json, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
-import requests as req
-from flask import Flask, render_template, request, jsonify, send_file, Response
+try:
+    import requests as req
+    from flask import Flask, render_template, request, jsonify, send_file, Response
 
-from core.utils import log, sanitize_filename, build_filename, format_duration
-from platforms.netease import NeteaseAPI, decrypt_ncm, parse_netease_url
-from platforms.tonzhon_api import resolve_song_url, resolve_song_url_raw, get_lyrics as tonzhon_lyrics
+    from core.utils import log, sanitize_filename, build_filename, format_duration
+    from platforms.netease import NeteaseAPI, decrypt_ncm, parse_netease_url
+    from platforms.tonzhon_api import resolve_song_url, resolve_song_url_raw, get_lyrics as tonzhon_lyrics
+except ImportError as e:
+    print(f"缺少依赖: {e}")
+    print("请运行: pip install flask requests mutagen pycryptodomex beautifulsoup4 lxml")
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -38,15 +43,6 @@ PLATFORMS = {
     "netease":  {"name": "网易云", "icon": "🎵"},
     "qq":       {"name": "QQ音乐", "icon": "🐧"},
     "kugou":    {"name": "酷狗",   "icon": "🐶"},
-    "kuwo":     {"name": "酷我",   "icon": "🎤"},
-    "baidu":    {"name": "千千",   "icon": "🎼"},
-    "migu":     {"name": "咪咕",   "icon": "📻"},
-    "lizhi":    {"name": "荔枝",   "icon": "🔴"},
-    "qingting": {"name": "蜻蜓",   "icon": "🟢"},
-    "ximalaya": {"name": "喜马拉雅", "icon": "🏔"},
-    "5singyc":  {"name": "5sing原创", "icon": "🎸"},
-    "5singfc":  {"name": "5sing翻唱", "icon": "🎙"},
-    "kg":       {"name": "全民K歌", "icon": "🎶"},
 }
 
 
@@ -58,11 +54,13 @@ _XMSJ_SITES = [
 
 
 def _search_xmsj_like(base_url: str, source_name: str, query: str, platform: str = "netease", page: int = 1) -> dict:
-    """Generic search for xmsj-based sites (maicong/music project)."""
+    """Generic search for xmsj-based sites (maicong/music project).
+    Always queries netease internally since other platforms may not be supported."""
+    search_type = "netease"  # xmsj-like sites work best with netease
     try:
         resp = req.post(
             base_url,
-            data={"input": query, "filter": "name", "type": platform, "page": page},
+            data={"input": query, "filter": "name", "type": search_type, "page": page},
             headers={
                 "User-Agent": "Mozilla/5.0",
                 "X-Requested-With": "XMLHttpRequest",
@@ -74,11 +72,15 @@ def _search_xmsj_like(base_url: str, source_name: str, query: str, platform: str
         if data.get("code") == 200:
             songs = []
             for item in data.get("data", []):
+                # Handle both xmsj format (title/author) and myhkw format (name/artist)
+                title = item.get("title") or item.get("name", "Unknown")
+                artist = item.get("author") or item.get("artist", "Unknown")
+                artist = artist.replace("/", ", ")
                 songs.append({
                     "id": str(item.get("songid", "")),
-                    "title": item.get("title", "Unknown"),
-                    "artist": item.get("author", "Unknown"),
-                    "cover": item.get("pic", ""),
+                    "title": title,
+                    "artist": artist,
+                    "cover": item.get("pic") or item.get("cover", ""),
                     "lyric": item.get("lrc", ""),
                     "url": item.get("url", ""),
                     "link": item.get("link", ""),
@@ -148,22 +150,26 @@ def search_luckxz(query: str, platform: str = "netease", page: int = 1) -> dict:
 
         soup = BeautifulSoup(resp.text, "lxml")
         songs = []
-        for item in soup.select(".music-list li, .song-item, article")[:20]:
-            title_el = item.select_one("h2 a, .title a, h3 a")
-            if not title_el:
+        # luckxz results are in h2 tags: 《title》-artist [format]
+        import re
+        for h2 in soup.select("h2")[:20]:
+            text = h2.get_text(strip=True)
+            # Pattern: 《songname》-artist [WAV/MP3/FLAC]
+            match = re.match(r'[《「](.+?)[》」]\s*-\s*(.+?)\s*\[', text)
+            if not match:
                 continue
-            title = title_el.text.strip()
-            link = title_el.get("href", "")
-            if not link.startswith("http"):
+            title = match.group(1).strip()
+            artist = match.group(2).strip()
+            # Also try to find download link
+            link_el = soup.select_one(f'a[href*="{title[:4]}"]') if len(title) >= 4 else None
+            link = link_el.get("href", "") if link_el else ""
+            if link and not link.startswith("http"):
                 link = "https://luckxz.com" + link
 
-            artist_el = item.select_one(".author, .singer, .artist, .meta")
-            artist = artist_el.text.strip() if artist_el else ""
-
             songs.append({
-                "id": link.split("/")[-1].replace(".html", ""),
+                "id": link.split("/")[-1].replace(".html", "") if link else f"lx{abs(hash(title))%100000}",
                 "title": title,
-                "artist": artist or "Unknown",
+                "artist": artist,
                 "cover": "",
                 "lyric": "",
                 "url": link,
@@ -177,36 +183,49 @@ def search_luckxz(query: str, platform: str = "netease", page: int = 1) -> dict:
         return {"songs": [], "total": 0, "error": str(e)}
 
 
+def search_kugou(query: str, platform: str = "kugou", page: int = 1) -> dict:
+    """Search via Kugou mobile API (works globally)."""
+    try:
+        resp = req.get(
+            "http://mobilecdn.kugou.com/api/v3/search/song",
+            params={"format": "json", "keyword": query, "page": page, "pagesize": 20, "showtype": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        data = resp.json()
+        songs = []
+        for item in data.get("data", {}).get("info", []):
+            songs.append({
+                "id": item.get("hash", ""),
+                "title": item.get("songname", "Unknown"),
+                "artist": item.get("singername", "Unknown"),
+                "cover": "",
+                "lyric": "",
+                "url": "",
+                "link": f"https://www.kugou.com/song/#hash={item.get('hash','')}",
+                "platform": "kugou",
+                "platform_name": "酷狗",
+                "source": "kugou",
+                "filename": item.get("filename", ""),  # e.g. "周杰伦 - 晴天"
+            })
+        total = data.get("data", {}).get("total", len(songs))
+        return {"songs": songs, "total": total, "error": None}
+    except Exception as e:
+        return {"songs": [], "total": 0, "error": str(e)}
+
+
 def search_direct(query: str, platform: str = "netease", page: int = 1) -> dict:
-    """Fallback: search directly via our API (NetEase only)."""
-    if platform != "netease":
-        return {"songs": [], "total": 0, "error": "Direct search only supports NetEase"}
+    """Search directly via NetEase API — works for any platform tab
+    since most songs exist on NetEase regardless of source preference."""
     try:
         result = api.search_sync(query, page=page, limit=20)
-        # Batch-fetch song details (concurrent) to get cover URLs
-        import concurrent.futures
-        ids = [s.song_id for s in result.songs]
-        details = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-            futures = {ex.submit(api.get_song_detail_sync, sid): sid for sid in ids}
-            for fut in concurrent.futures.as_completed(futures, timeout=15):
-                try:
-                    d = fut.result()
-                    if d:
-                        details[futures[fut]] = d
-                except Exception:
-                    pass
-
         songs = []
         for s in result.songs:
-            d = details.get(s.song_id)
-            cover = (d.cover_url if d and d.cover_url else
-                     s.cover_url if s.cover_url else "")
             songs.append({
                 "id": s.song_id,
                 "title": s.title,
                 "artist": s.artist,
-                "cover": cover,
+                "cover": s.cover_url or "",
                 "lyric": "",
                 "url": "",
                 "link": f"https://music.163.com/#/song?id={s.song_id}",
@@ -231,22 +250,22 @@ def _register_sources():
     """Register all search sources in priority order. Add new sites here."""
     SEARCH_SOURCES.clear()
 
-    # Source 1: direct NetEase API — highest priority, most reliable
+    # Source 1: myhkw QQ search (works!) — for qq platform
+    SEARCH_SOURCES.append(("myhkw", search_myhkw, ["qq"]))
+
+    # Source 2: Kugou native API — for kugou platform
+    SEARCH_SOURCES.append(("kugou", search_kugou, ["kugou"]))
+
+    # Source 3: direct NetEase API — for netease
     SEARCH_SOURCES.append(("direct", search_direct, ["netease"]))
 
-    # Source 2: xmsj.org — 12 platforms via China proxy
-    SEARCH_SOURCES.append(("xmsj", search_xmsj, list(PLATFORMS.keys())))
+    # Source 4: myhkw netease — additional netease results
+    SEARCH_SOURCES.append(("myhkw_ne", search_myhkw, ["netease"]))
 
-    # Source 2: s.myhkw.cn (明月浩空) — same codebase as xmsj, 4 platforms
-    SEARCH_SOURCES.append(("myhkw", search_myhkw, ["netease", "qq", "kugou", "kuwo"]))
-
-    # Source 3: Tonzhon — audio source resolver (netease/qq/migu)
-    SEARCH_SOURCES.append(("tonzhon", search_tonzhon, ["netease", "qq", "migu"]))
-
-    # Source 4: luckxz.com (幸运小猪) — blog-style MP3 download site
+    # Source 5: luckxz.com (幸运小猪) — generic
     SEARCH_SOURCES.append(("luckxz", search_luckxz, ["netease"]))
 
-    # Source 5: xiageba.liumingye.cn (下歌吧) — lowest priority, Nuxt-based
+    # Source 6: xiageba (下歌吧) — generic
     SEARCH_SOURCES.append(("xiageba", search_xiageba, ["netease"]))
 
 def _normalize(text: str) -> str:
@@ -268,9 +287,7 @@ def _dedup_songs(all_songs: list[dict]) -> list[dict]:
 
 
 def search_tonzhon(query: str, platform: str = "netease", page: int = 1) -> dict:
-    """Search via Tonzhon's API (limited platforms, but China server)."""
-    if platform not in ("netease", "qq", "migu"):
-        return {"songs": [], "total": 0, "error": f"Tonzhon doesn't support {platform}"}
+    """Search via Tonzhon's API (search netease for any platform since songs overlap)."""
     try:
         # Tonzhon uses /api/search/{keyword} for authenticated, but we can try
         # Home page /api/new-songs for discovery
@@ -308,7 +325,7 @@ def search_all_sources(query: str, platform: str = "netease", page: int = 1) -> 
     import concurrent.futures
 
     all_songs = []
-    errors = []
+    max_total = 0
     results_by_source = {}  # name → [songs]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -323,7 +340,8 @@ def search_all_sources(query: str, platform: str = "netease", page: int = 1) -> 
                 result = fut.result()
                 if result.get("songs"):
                     results_by_source[name] = result["songs"]
-                    log.info(f"[{name}] found {len(result['songs'])} results")
+                    max_total = max(max_total, result.get("total", 0))
+                    log.info(f"[{name}] found {len(result['songs'])} results, total={result.get('total',0)}")
                 elif result.get("error"):
                     log.debug(f"[{name}] {result['error']}")
             except Exception as e:
@@ -337,8 +355,10 @@ def search_all_sources(query: str, platform: str = "netease", page: int = 1) -> 
 
     # Dedup and return
     deduped = _dedup_songs(all_songs)
-    log.info(f"Search: {len(all_songs)} raw → {len(deduped)} deduped from {len(results_by_source)} sources")
-    return {"songs": deduped[:20], "total": len(deduped), "error": None if deduped else "No results from any source"}
+    # Use the largest total reported by any source for pagination
+    display_total = max(max_total, len(deduped))
+    log.info(f"Search: {len(all_songs)} raw → {len(deduped)} deduped (total={display_total}) from {len(results_by_source)} sources")
+    return {"songs": deduped[:20], "total": display_total, "error": None if deduped else "No results from any source"}
 
 
 # Register sources now that all functions are defined
@@ -412,145 +432,111 @@ def api_song_detail(platform, song_id):
 
 
 @app.route("/api/download/<platform>/<song_id>")
+def _cross_search_netease(title: str, artist: str) -> tuple[str, str, str] | None:
+    """Find a matching song on NetEase. Returns (song_id, artist, title) or None."""
+    try:
+        q = f"{title} {artist}" if artist else title
+        result = api.search_sync(q, limit=3)
+        if result.songs:
+            for ns in result.songs:
+                cdn_url = resolve_song_url(ns.song_id, "netease")
+                if cdn_url:
+                    return (ns.song_id, ns.artist, ns.title)
+    except Exception:
+        pass
+    return None
+
+
+def _download_mp3_from_cdn(cdn_url: str, artist: str, title: str, song_id: str, platform: str):
+    """Download MP3 from CDN URL, embed cover, return Response."""
+    mp3_data = None
+    for hdrs in [
+        {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://music.163.com/"},
+        {"User-Agent": "NeteaseMusic/8.0.0", "Referer": "https://music.163.com/"},
+        {"User-Agent": "Mozilla/5.0", "Referer": "https://tonzhon.whamon.com/"},
+    ]:
+        try:
+            r = req.get(cdn_url, timeout=25, headers=hdrs)
+            if r.status_code == 200 and (r.content[:3] == b"ID3" or r.content[:4] == b"fLaC"):
+                mp3_data = r.content
+                break
+        except Exception:
+            continue
+
+    if not mp3_data:
+        return None
+
+    # Embed cover
+    try:
+        cover_url = ""
+        if platform == "netease" or True:  # always try netease detail for cover
+            detail = api.get_song_detail_sync(song_id)
+            if detail and detail.cover_url:
+                cover_url = detail.cover_url
+        if cover_url:
+            cr = req.get(cover_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if cr.status_code == 200 and len(cr.content) > 500:
+                from mutagen.mp3 import MP3
+                from mutagen.id3 import ID3, APIC
+                import tempfile as _tmp
+                tf = _tmp.NamedTemporaryFile(delete=False, suffix=".mp3")
+                tf.write(mp3_data); tf.close()
+                audio = MP3(tf.name, ID3=ID3)
+                if audio.tags is None: audio.add_tags()
+                mime = "image/png" if cr.content[:4] == b"\x89PNG" else "image/jpeg"
+                audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cr.content))
+                audio.save()
+                with open(tf.name, "rb") as f: mp3_data = f.read()
+                os.unlink(tf.name)
+    except Exception:
+        pass
+
+    from urllib.parse import quote
+    safe = f"{artist} - {title}".encode("ascii", "ignore").decode().strip() or "song"
+    safe = safe.replace('"', '').replace("'", "")[:80]
+    return Response(mp3_data, content_type="audio/mpeg",
+        headers={"Content-Disposition": f"attachment; filename=\"{safe}.mp3\"; filename*=UTF-8''{quote(f'{artist} - {title}.mp3')}"})
+
+
+@app.route("/api/download/<platform>/<song_id>")
 def api_download(platform, song_id):
-    """Download MP3 + LRC — Tonzhon audio → server-side stream + NetEase lyrics."""
-    lrc = request.args.get("lrc", "1")  # 1=include LRC, 0=MP3 only
-    artist, title = "Unknown", song_id
+    """Download MP3. Cross-searches NetEase for non-netease platforms."""
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+    name = f"{artist} - {title}" if title else song_id
 
     try:
-        # ── Get metadata ──
+        # Get netease song ID (cross-search if needed)
+        ne_id = song_id if platform == "netease" else None
+        if not ne_id:
+            matched = _cross_search_netease(title, artist)
+            if matched:
+                ne_id, artist, title = matched
+                log.info(f"Cross-matched: {platform}/{song_id} → netease/{ne_id}")
+
+        # Try Tonzhon download
+        if ne_id:
+            cdn_url = resolve_song_url(ne_id, "netease")
+            if cdn_url:
+                resp = _download_mp3_from_cdn(cdn_url, artist or "Unknown", title or "Unknown", ne_id, "netease")
+                if resp:
+                    return resp
+
+        # Try direct API (netease only)
         if platform == "netease":
-            detail = api.get_song_detail_sync(song_id)
-            if detail:
-                artist, title = detail.artist, detail.title
-
-        # ── Strategy 1: Tonzhon → immediate server-side download → stream ──
-        cdn_url = resolve_song_url(song_id, platform)
-        if cdn_url:
-            # Try multiple CDN access strategies
-            mp3_data = None
-            for attempt_headers in [
-                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://music.163.com/"},
-                {"User-Agent": "NeteaseMusic/8.0.0 (iPhone; iOS 16.0; Scale/3.00)", "Referer": "https://music.163.com/"},
-                {"User-Agent": "Mozilla/5.0", "Referer": "https://tonzhon.whamon.com/"},
-            ]:
-                try:
-                    cdn_resp = req.get(cdn_url, stream=True, timeout=30, headers=attempt_headers)
-                    if cdn_resp.status_code == 200:
-                        data = cdn_resp.content
-                        if data[:3] == b"ID3" or data[:4] == b"fLaC":
-                            mp3_data = data
-                            break
-                except Exception:
-                    continue
-
-            if mp3_data:
-                # ── Embed cover art into MP3 via mutagen ──
-                try:
-                    cover_url = ""
-                    if platform == "netease":
-                        detail = api.get_song_detail_sync(song_id)
-                        if detail and detail.cover_url:
-                            cover_url = detail.cover_url
-                    if cover_url and cover_url.startswith("http"):
-                        try:
-                            cover_resp = req.get(cover_url, timeout=10,
-                                headers={"User-Agent": "Mozilla/5.0"})
-                            if cover_resp.status_code == 200 and len(cover_resp.content) > 500:
-                                cover_data = cover_resp.content
-                                mime = "image/png" if cover_data[:4] == b"\x89PNG" else "image/jpeg"
-
-                                from mutagen.mp3 import MP3
-                                from mutagen.id3 import ID3, APIC
-                                import tempfile as _tmp
-
-                                # Write MP3 to temp file for mutagen
-                                _tf = _tmp.NamedTemporaryFile(delete=False, suffix=".mp3")
-                                _tf.write(mp3_data)
-                                _tf.close()
-
-                                audio = MP3(_tf.name, ID3=ID3)
-                                if audio.tags is None:
-                                    audio.add_tags()
-                                audio.tags.add(APIC(
-                                    encoding=3, mime=mime, type=3,
-                                    desc="Cover", data=cover_data
-                                ))
-                                audio.save()
-
-                                with open(_tf.name, "rb") as _f:
-                                    mp3_data = _f.read()
-                                os.unlink(_tf.name)
-                                log.info(f"Cover embedded: {len(mp3_data)} bytes")
-                        except Exception as e:
-                            log.debug(f"Cover embed skipped: {e}")
-                except ImportError:
-                    pass  # mutagen not available
-
-                # Return MP3 file
-                from urllib.parse import quote
-                safe_name = f"{artist} - {title}"
-                safe_name = safe_name.encode("ascii", "ignore").decode().strip() or "song"
-                safe_name = safe_name.replace('"', '').replace("'", "")[:80]
-                return Response(
-                    mp3_data,
-                    content_type="audio/mpeg",
-                    headers={
-                        "Content-Disposition": f"attachment; filename=\"{safe_name}.mp3\"; filename*=UTF-8''{quote(f'{artist} - {title}.mp3')}"
-                    }
-                )
-
-            # CDN download failed — return direct URL as fallback
-            filename = build_filename(artist, title, "mp3")
-            safe_name = filename.encode("ascii", "ignore").decode() or "song.mp3"
-            return jsonify({"success": True, "redirect_url": cdn_url, "filename": safe_name})
-
-        # ── Strategy 2: Direct NetEase API ──
-        if platform == "netease":
-            detail = api.get_song_detail_sync(song_id)
-            if detail:
-                artist, title = detail.artist, detail.title
             url = api.get_song_url_sync(song_id, "standard")
             if url:
-                return stream_download(url, artist, title, "standard")
+                return stream_download(url, artist or "Unknown", title or "Unknown", "standard")
 
-        # ── Strategy 3: xmsj.org URL ──
-        try:
-            resp = req.post(
-                XMSJ_URL,
-                data={"input": song_id, "filter": "id", "type": platform, "page": 1},
-                headers={"User-Agent": "Mozilla/5.0", "X-Requested-With": "XMLHttpRequest", "Referer": XMSJ_URL},
-                timeout=15,
-            )
-            data = resp.json()
-            if data.get("code") == 200 and data.get("data"):
-                item = data["data"][0]
-                artist = item.get("author", artist)
-                title = item.get("title", title)
-                xm_url = item.get("url", "")
-                if xm_url:
-                    try:
-                        audio_resp = req.get(xm_url, timeout=15, allow_redirects=True,
-                                            headers={"User-Agent": "Mozilla/5.0", "Referer": XMSJ_URL})
-                        if "audio" in audio_resp.headers.get("Content-Type", "") or len(audio_resp.content) > 10000:
-                            return stream_download_from_bytes(audio_resp.content, artist, title)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # ── Nothing worked ──
         return jsonify({
-            "error": "无法获取下载链接",
-            "detail": "该歌曲在当前所有音源中均未找到可下载版本。Tonzhon未缓存、直接API地理限制、xmsj不可用。",
+            "error": "无法下载",
+            "detail": f"《{name}》在所有音源中未找到可下载版本。",
             "solutions": [
-                {"title": "换个平台试试", "desc": "尝试在QQ音乐、酷狗、咪咕等其他平台搜索同名歌曲"},
-                {"title": "部署Vercel代理", "desc": "部署 NeteaseCloudMusicApi 到 Vercel",
-                 "url": "https://github.com/Binaryify/NeteaseCloudMusicApi",
-                 "note": "启动: python web.py --api-base https://你的项目.vercel.app"},
+                {"title": "换到网易云平台搜索同名歌曲再下载"},
+                {"title": "部署 Vercel 代理", "url": "https://github.com/Binaryify/NeteaseCloudMusicApi",
+                 "note": "python web.py --api-base https://你的项目.vercel.app"},
             ]
         }), 403
-
     except Exception as e:
         log.error(f"Download error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -723,7 +709,7 @@ def api_status():
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="Music Downloader Web UI")
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=5000)
     p.add_argument("--api-base", default="", help="Custom API base for geo-unblock")
     p.add_argument("--cookie", "-c", default="")

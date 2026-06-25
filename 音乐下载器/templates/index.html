@@ -238,7 +238,7 @@ input{background:#1f1f1f;color:#d9d9d9;border:1px solid #333}
 // ============================================================
 let curFilter = 'name';
 let curPlatform = 'netease';
-let curPage = 1, curQuery = '', curSection = 'search';
+let curPage = 1, curQuery = '', curSection = 'search', curTotal = 0;
 let audio = new Audio();
 let playlist = [], playIdx = -1;
 
@@ -287,6 +287,20 @@ audio.volume = 0.7;
 // ============================================================
 function toast(m, ms=2500) { const t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'), ms); }
 function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+// Auto-retry broken covers — fetch from detail API as fallback
+const coverRetryMap = {};
+async function retryCover(img, songId, platform) {
+  await fetchCoverForSong(songId, platform);
+  const key = songId + '@' + platform;
+  if (coverRetryMap[key] && coverRetryMap[key] !== 'failed') {
+    img.src = coverRetryMap[key];
+  } else {
+    coverRetryMap[key] = 'failed';
+    img.style.display = 'flex';
+    img.alt = '🎵';
+  }
+}
 function fmtTime(s) { if (!s||isNaN(s)) return '00:00'; const m=Math.floor(s/60), sec=Math.floor(s%60); return `${m}:${sec.toString().padStart(2,'0')}`; }
 
 function switchFilter(f, btn) {
@@ -324,7 +338,8 @@ async function doSearch(page) {
     if (data.error) { document.getElementById('songList').innerHTML=`<div class="error-box"><h3>搜索失败</h3><p>${data.error}</p></div>`; return; }
     playlist = data.songs;
     renderSongs(data.songs);
-    document.getElementById('resultCount').textContent = data.total ? `找到 ${data.total} 首` : '';
+    curTotal = data.total || 0;
+    document.getElementById('resultCount').textContent = curTotal ? `找到 ${curTotal} 首` : '';
     renderPagination(page);
   } catch(e) {
     document.getElementById('songList').innerHTML = `<div class="error-box"><h3>搜索失败</h3><p>${e.message}</p></div>`;
@@ -340,7 +355,9 @@ function renderSongs(songs) {
     <li class="song-item" id="song-${s.id}">
       <div class="song-row" onclick="toggleSong('${s.id}','${s.platform}',${i})">
         <span class="song-idx">${i+1}</span>
-        <img class="song-cover" src="${s.cover||''}" onerror="this.style.display='none'" loading="lazy">
+        <img class="song-cover" src="${s.cover||''}"
+             onerror="retryCover(this,'${s.id}','${s.platform}')" loading="lazy"
+             style="background:#262626;display:flex;align-items:center;justify-content:center;color:#595959;font-size:18px;font-weight:bold;flex-shrink:0">
         <div class="song-info">
           <div class="title">${esc(s.title)}</div>
           <div class="meta">${esc(s.artist)}</div>
@@ -350,6 +367,30 @@ function renderSongs(songs) {
       </div>
       <div class="song-detail" id="detail-${s.id}"><div style="text-align:center;padding:12px;color:#595959;">加载中...</div></div>
     </li>`).join('');
+  // Auto-fetch missing covers for all songs
+  songs.forEach(s => {
+    if (!s.cover || !s.cover.startsWith('http')) {
+      fetchCoverForSong(s.id, s.platform);
+    }
+  });
+}
+
+// Fetch and set cover for a song
+async function fetchCoverForSong(songId, platform) {
+  const key = songId + '@' + platform;
+  if (coverRetryMap[key]) return;
+  try {
+    const resp = await fetch(`/api/song/${platform}/${songId}`);
+    const d = await resp.json();
+    if (d.cover && d.cover.startsWith('http')) {
+      coverRetryMap[key] = d.cover;
+      // Update all imgs for this song
+      document.querySelectorAll(`[id=\"song-${songId}\"] .song-cover`).forEach(img => {
+        img.src = d.cover;
+        img.onerror = null;
+      });
+    }
+  } catch(e) {}
 }
 
 async function toggleSong(songId, platform, idx) {
@@ -365,8 +406,8 @@ async function toggleSong(songId, platform, idx) {
       const lrc = song.lyric || '';
       detail.innerHTML = `
         <div class="detail-actions">
-          <button class="btn btn-primary" onclick="downloadSong('${songId}','${platform}')">⬇ 下载 MP3</button>
-          <button class="btn btn-outline btn-sm" onclick="downloadLrc('${songId}','${platform}')">📝 下载LRC歌词</button>
+          <button class="btn btn-primary" onclick="downloadSong('${songId}','${platform}','${esc(song.title).replace(/'/g,"\\'")}','${esc(song.artist).replace(/'/g,"\\'")}')">⬇ 下载 MP3</button>
+          <button class="btn btn-outline btn-sm" onclick="downloadLrc('${songId}','${platform}','${esc(song.title).replace(/'/g,"\\'")}','${esc(song.artist).replace(/'/g,"\\'")}')">📝 下载LRC歌词</button>
           <button class="btn btn-outline btn-sm" onclick="playSong('${songId}','${platform}','${esc(song.title).replace(/'/g,"\\'")}','${esc(song.artist).replace(/'/g,"\\'")}','${(song.cover||'').replace(/'/g,"\\'")}')">▶ 播放</button>
           ${lrc ? '<button class="btn btn-outline btn-sm" onclick="toggleLyrics(\''+songId+'\')">👁 预览歌词</button>' : ''}
         </div>
@@ -382,9 +423,11 @@ async function toggleSong(songId, platform, idx) {
 
 function toggleLyrics(songId) { document.getElementById('lyrics-'+songId).classList.toggle('show'); }
 
-function downloadLrc(songId, platform) {
+function downloadLrc(songId, platform, title, artist) {
+  let url = `/api/lrc/${platform}/${songId}`;
+  if (title) url += `?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist||'')}`;
   const a = document.createElement('a');
-  a.href = `/api/lrc/${platform}/${songId}`;
+  a.href = url;
   a.download = '';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   toast('📝 LRC 歌词下载已开始');
@@ -439,10 +482,12 @@ function playerNext() { toast('无下一首'); }
 // ============================================================
 // Download
 // ============================================================
-async function downloadSong(songId, platform) {
+async function downloadSong(songId, platform, title, artist) {
   toast('正在获取下载链接... 音频获取较慢，请耐心等待（10秒内）');
   try {
-    const resp = await fetch(`/api/download/${platform}/${songId}`);
+    let url = `/api/download/${platform}/${songId}`;
+    if (title) url += `?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist||'')}`;
+    const resp = await fetch(url);
     const contentType = resp.headers.get('Content-Type') || '';
 
     if (resp.ok && (contentType.includes('audio') || contentType.includes('octet-stream'))) {
@@ -516,22 +561,38 @@ async function uploadNcm() {
 // Pagination
 function renderPagination(page) {
   const pg = document.getElementById('pagination');
-  const totalPages = 99; // enough for practical use
+  const perPage = 20;
+  const totalPages = Math.max(1, Math.ceil(curTotal / perPage));
+  if (totalPages <= 1) { pg.style.display = 'none'; return; }
+
   let html = `<button ${page<=1?'disabled':''} onclick="doSearch(${page-1})">‹ 上一页</button>`;
-  // First 3 pages
-  for (let i=1; i<=3 && i<=totalPages; i++) {
-    html += `<button class="${i===page?'active':''}" onclick="doSearch(${i})">${i}</button>`;
+  // Show page buttons: first 3 ... current area ... last 2
+  const pagesToShow = [];
+  if (totalPages <= 8) {
+    for (let i=1; i<=totalPages; i++) pagesToShow.push(i);
+  } else {
+    pagesToShow.push(1,2,3);
+    if (page > 4) pagesToShow.push('...');
+    for (let i=Math.max(4, page-1); i<=Math.min(totalPages-3, page+1); i++) pagesToShow.push(i);
+    if (page < totalPages-3) pagesToShow.push('...');
+    pagesToShow.push(totalPages-1, totalPages);
   }
+
+  for (const p of pagesToShow) {
+    if (p === '...') {
+      html += `<span style="padding:6px 4px;color:#595959">…</span>`;
+    } else {
+      html += `<button class="${p===page?'active':''}" onclick="doSearch(${p})">${p}</button>`;
+    }
+  }
+
   // Jump input
   html += `<input type="number" id="jumpPage" min="1" max="${totalPages}" value="${page}"
     style="width:50px;text-align:center;background:#1f1f1f;color:#d9d9d9;border:1px solid #333;border-radius:16px;padding:6px 8px;font-size:12px"
     onkeydown="if(event.key==='Enter'){const v=parseInt(this.value); if(v>=1)doSearch(v)}">
   <button onclick="const v=parseInt(document.getElementById('jumpPage').value); if(v>=1)doSearch(v)" style="padding:6px 12px;background:#fa8c16;color:#fff;border:none;border-radius:16px;cursor:pointer;font-size:12px">跳转</button>`;
-  // Last 2 pages
-  for (let i=totalPages-1; i<=totalPages; i++) {
-    html += `<button class="${i===page?'active':''}" onclick="doSearch(${i})">${i}</button>`;
-  }
-  html += `<button onclick="doSearch(${page+1})">下一页 ›</button>`;
+
+  html += `<button ${page>=totalPages?'disabled':''} onclick="doSearch(${page+1})">下一页 ›</button>`;
   pg.innerHTML = html;
   pg.style.display = 'flex';
 }
