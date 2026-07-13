@@ -1,11 +1,9 @@
 @echo off
 cd /d "%~dp0"
 
-:: find Python
+:: find Python (use 'where' to avoid python3 alias triggering Microsoft Store)
 set PY=python
-%PY% --version >nul 2>&1
-if errorlevel 1 set PY=python3
-%PY% --version >nul 2>&1
+where %PY% >nul 2>&1
 if errorlevel 1 (
     echo Python not found! Please install Python 3.8+
     echo https://www.python.org/downloads/
@@ -28,7 +26,11 @@ set PYTHONPATH=%PKG_DIR%
 :: check and auto-install dependencies
 echo Checking dependencies...
 set DEPS=flask requests mutagen pycryptodomex beautifulsoup4 lxml aiohttp
-%PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+:: use pip show instead of Python import (aiohttp import takes 10+ seconds!)
+:: check both system and local _packages dir
+%PY% -m pip show %DEPS% >nul 2>&1
+if not errorlevel 1 goto deps_ok
+%PY% -m pip show --target="%PKG_DIR%" %DEPS% >nul 2>&1
 if not errorlevel 1 goto deps_ok
 
 echo.
@@ -47,16 +49,16 @@ if errorlevel 1 (
     %PY% -m pip install %DEPS% --disable-pip-version-check
 )
 
-:: Verify installation worked
+:: Verify installation worked (uses import - only runs during first install)
 set PYTHONPATH=%PKG_DIR%
-%PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+%PY% -c "import flask,requests,mutagen,bs4,lxml,aiohttp" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo ==========================================
     echo   Install FAILED! Trying system-wide...
     echo ==========================================
     %PY% -m pip install %DEPS% --user --disable-pip-version-check
-    %PY% -c "import flask, requests, mutagen, bs4, lxml, aiohttp" >nul 2>&1
+    %PY% -c "import flask,requests,mutagen,bs4,lxml,aiohttp" >nul 2>&1
     if errorlevel 1 (
         echo.
         echo FATAL: Cannot install dependencies!
