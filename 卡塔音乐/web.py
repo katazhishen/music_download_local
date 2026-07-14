@@ -10,7 +10,7 @@ Usage:
     # Open http://127.0.0.1:5000
 """
 
-import os, sys, json, tempfile
+import os, sys, json, tempfile, time, threading, itertools
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -56,12 +56,122 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
+IS_PRODUCTION = os.environ.get("RENDER", "").lower() == "true"
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
-app.config["TEMPLATES_AUTO_RELOAD"] = True  # always use latest template
+app.config["TEMPLATES_AUTO_RELOAD"] = not IS_PRODUCTION
 
 api = NeteaseAPI()
-DOWNLOAD_DIR = Path.cwd()
+
+if IS_PRODUCTION:
+    DOWNLOAD_DIR = Path("/tmp/downloads")
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+else:
+    DOWNLOAD_DIR = Path.cwd()
+
+
+# ---------------------------------------------------------------------------
+# Console warning — "DO NOT CLOSE THIS WINDOW"
+# ---------------------------------------------------------------------------
+def _enable_vt_processing():
+    """Enable ANSI virtual terminal processing on Windows (Win10 1511+)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VT = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        if not (mode.value & ENABLE_VT):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VT)
+    except Exception:
+        pass
+
+
+def _print_warning_banner():
+    """Show a colourful scrolling-then-static warning so users don't close the
+    console window by mistake.
+
+    The warning animates for ~3 seconds (rainbow colour cycle) then settles
+    into a static red bold banner.  A daemon thread runs the animation so the
+    server can start immediately.
+    """
+    if not sys.stdout.isatty():
+        return
+
+    _enable_vt_processing()
+
+    # Fallback: print a plain banner if threading isn't viable
+    try:
+        _print_animated_warning()
+    except Exception:
+        _print_static_warning()
+
+
+def _print_static_warning():
+    """Static red bold warning — works even without ANSI (text degrades)."""
+    RED = "\033[1;31m"
+    RESET = "\033[0m"
+    line = "=" * 50
+    sys.stdout.write(
+        f"\n{RED}{line}{RESET}\n"
+        f"{RED}  🈲！！！运行时请勿关闭此窗口！！！🈲  {RESET}\n"
+        f"{RED}  🈲  DO NOT CLOSE THIS WINDOW!  🈲  {RESET}\n"
+        f"{RED}{line}{RESET}\n\n"
+    )
+    sys.stdout.flush()
+
+
+def _print_animated_warning():
+    """Rainbow colour-cycle for 3 s, then static red banner."""
+    # 256-color palette indices — warm → cool → warm loop
+    COLORS = [196, 202, 208, 214, 220, 226, 190, 154, 118, 82,
+              46, 47, 48, 49, 50, 51, 45, 39, 33, 27, 21, 20, 19, 18, 17]
+    TEXT_CN = "🈲！！！运行时请勿关闭此窗口！！！🈲"
+    TEXT_EN = "🈲  DO NOT CLOSE THIS WINDOW!  🈲"
+    BORDER = "=" * 50
+
+    RED = "\033[1;31m"
+    RESET = "\033[0m"
+    LINES = 3
+
+    stop = threading.Event()
+
+    def _cycle():
+        i = 0
+        while not stop.is_set():
+            c = COLORS[i % len(COLORS)]
+            code = f"\033[1;38;5;{c}m"
+            sys.stdout.write(
+                f"\r{code}{BORDER}{RESET}\n"
+                f"{code}  {TEXT_CN}  {RESET}\n"
+                f"{code}  {TEXT_EN}  {RESET}"
+            )
+            sys.stdout.flush()
+            time.sleep(0.12)
+            if i > 0:
+                sys.stdout.write(f"\033[{LINES}A")
+            i += 1
+
+    t = threading.Thread(target=_cycle, daemon=True)
+    t.start()
+    time.sleep(3)
+    stop.set()
+    t.join(timeout=0.5)
+
+    # Clear cycling lines and print static warning
+    sys.stdout.write("\r\033[K" * LINES)
+    sys.stdout.write(f"\033[{LINES}A")
+    sys.stdout.write(
+        f"\r{RED}{BORDER}{RESET}\n"
+        f"{RED}  {TEXT_CN}  {RESET}\n"
+        f"{RED}  {TEXT_EN}  {RESET}\n\n"
+    )
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -304,10 +414,10 @@ def search_direct(query: str, platform: str = "netease", page: int = 1) -> dict:
             try:
                 ids_str = "[" + ",".join(need_cover_ids) + "]"
                 detail_resp = req.get(
-                    "http://music.163.com/api/song/detail",
+                    "https://music.163.com/api/song/detail",
                     params={"id": need_cover_ids[0], "ids": ids_str},
                     headers={
-                        "User-Agent": "Mozilla/5.0",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                         "Referer": "https://music.163.com/",
                     },
                     timeout=15,
@@ -332,7 +442,7 @@ def search_direct(query: str, platform: str = "netease", page: int = 1) -> dict:
         def _fetch_comment_count(sid):
             try:
                 r = req.get(
-                    f"http://music.163.com/api/v1/resource/comments/R_SO_4_{sid}",
+                    f"https://music.163.com/api/v1/resource/comments/R_SO_4_{sid}",
                     params={"limit": 0},
                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
                     timeout=8,
@@ -597,6 +707,7 @@ def search_all_sources(query: str, platform: str = "netease", page: int = 1) -> 
 
     all_songs = []
     max_total = 0
+    errors = []
     results_by_source = {}  # name → [songs]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -715,6 +826,55 @@ def api_song_detail(platform, song_id):
             })
 
     return jsonify({"error": "Song not found"}), 404
+
+
+@app.route("/api/cover")
+def api_cover_proxy():
+    """Proxy cover images through server to bypass CDN Referer restrictions.
+
+    NetEase CDN (p1.music.126.net etc.) now blocks requests that don't
+    carry a ``Referer: https://music.163.com/`` header.  Browsers send
+    the page's own origin as Referer, which gets rejected.  This endpoint
+    fetches the image server-side with the correct Referer and returns it.
+    """
+    url = request.args.get("url", "")
+    if not url or not url.startswith("http"):
+        return jsonify({"error": "Invalid URL"}), 400
+
+    # Allow only known music CDN domains (prevent open-proxy abuse)
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower()
+    allowed = (
+        "music.126.net", "p1.music.126.net", "p2.music.126.net",
+        "p3.music.126.net", "p4.music.126.net",
+        "music.163.com", "api.music.163.com",
+        "myhkw.cn", "s.myhkw.cn",
+        "kugou.com", "imge.kugou.com",
+        "kwimgs.kugou.com",
+        "qpic.cn", "y.gtimg.cn",
+    )
+    if not any(domain == d or domain.endswith("." + d) for d in allowed):
+        return jsonify({"error": "Domain not allowed"}), 403
+
+    try:
+        resp = req.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/130.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://music.163.com/",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "image/jpeg")
+        return Response(resp.content, content_type=content_type,
+                        headers={"Cache-Control": "public, max-age=86400"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 def _cross_search_netease(title: str, artist: str) -> tuple[str, str, str] | None:
@@ -1235,14 +1395,47 @@ def api_status():
     })
 
 
+@app.route("/robots.txt")
+def robots_txt():
+    """Tell crawlers to index the main page but stay away from API routes."""
+    return Response(
+        "User-agent: *\n"
+        "Allow: /$\n"
+        "Allow: /static/\n"
+        "Disallow: /api/\n"
+        "Disallow: /img/\n",
+        content_type="text/plain",
+    )
+
+
+@app.after_request
+def add_security_headers(response):
+    """Add basic security headers (safe in development)."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-XSS-Protection", "1; mode=block")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "media-src 'self' https:; "
+        "connect-src 'self' https:; "
+        "font-src 'self' data:;",
+    )
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    _print_warning_banner()
     import argparse
     p = argparse.ArgumentParser(description="Music Downloader Web UI")
     p.add_argument("--host", default="0.0.0.0")
-    p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 5000)))
     p.add_argument("--api-base", default="", help="Custom API base for geo-unblock")
     p.add_argument("--cookie", "-c", default="")
     p.add_argument("--output", "-o", default=".")
@@ -1257,11 +1450,13 @@ if __name__ == "__main__":
     if args.cookie:
         mod.api.import_cookie_string(args.cookie)
 
+    env_label = "PRODUCTION (Render)" if IS_PRODUCTION else "DEVELOPMENT"
     print(f"""
 ╔══════════════════════════════════════════════╗
-║      音乐下载器 Web UI v2.0                   ║
+║      音乐下载器 Web UI v3.0                   ║
 ║      支持: 网易云/QQ/酷狗/酷我/咪咕等12平台    ║
 ╠══════════════════════════════════════════════╣
+║  模式: {env_label:37s} ║
 ║  地址: http://{args.host}:{args.port}                  ║
 ║  输出: {str(DOWNLOAD_DIR)[:35]:35s} ║
 ╚══════════════════════════════════════════════╝
