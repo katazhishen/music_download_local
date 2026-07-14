@@ -2,6 +2,11 @@
 音乐下载器本地化部署
 
 
+网页版：https://soliar-katamusic.hf.space/
+
+ps:暂时借用了@Soliar 穗黎的网站
+
+
 点击“启动下载器.bat”启动，若如下图片报错。
 
 请先下载python的“flask”设置本地服务器❤
