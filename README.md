@@ -19,6 +19,7 @@ ps:暂时借用了@Soliar 穗黎的网站
 
 少数音乐网站能用，那些API管的松，其他好严。（封面是用交叉匹配网易云来获取的喵~，简称：假获取）
 
-<img width="790" height="694" alt="3" src="https://github.com/user-attachments/assets/7035fd1f-e3fd-4270-b246-15f4bb7c5090" />
+<img width="806" height="581" alt="屏幕截图 2026-07-15 145730" src="https://github.com/user-attachments/assets/57be2d70-9240-4612-a746-ac58982e282c" />
+
 
 点击右上角“了解更多”可以找我进行讨论哟！~
