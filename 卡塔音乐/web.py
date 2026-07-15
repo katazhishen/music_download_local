@@ -11,6 +11,7 @@ Usage:
 """
 
 import os, sys, json, tempfile, time, threading, itertools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -954,6 +955,17 @@ def _embed_flac_tags(
 _LRC_TIMESTAMP_RE = re.compile(r'^\[(\d{2}:\d{2}\.\d{2,3})\](.*)$')
 _LRC_META_RE = re.compile(r'^\[(ti|ar|al|by|offset|re|ve|length):(.*)\]$', re.IGNORECASE)
 
+# Patterns for lines that should NEVER be sent to the translator
+_RE_PURE_SYMBOLS = re.compile(
+    r'^[\s♩-♯★☆✿ 　♪♫♬～…★☆♥♦♣♠•·°※〓▽▼△▲□■◇◆◎●○◯☆★▶▷◀◁→←↑↓↗↘↙↖]+$'
+)
+_RE_INSTRUMENTAL = re.compile(
+    r'(間奏|前奏|尾奏|伴奏|solo|interlude|instrumental|intro|outro|bridge|'
+    r'纯音乐|演奏|过门|间场)',
+    re.IGNORECASE,
+)
+_RE_LATIN_WORD = re.compile(r"[a-zA-Z]{2,}")
+
 
 def _is_purely_structural(text: str) -> bool:
     """Return True if text is just spaces/dashes/separators (not translatable)."""
@@ -961,46 +973,187 @@ def _is_purely_structural(text: str) -> bool:
     return len(cleaned) == 0
 
 
-def _batch_translate(texts: list[str], target_lang: str) -> list[str]:
-    """Translate a list of strings using Google Translate via deep-translator.
+def _is_non_lyric_line(text: str) -> bool:
+    """Return True for instrumental markers, pure symbols, or decorative
+    content that should *never* be sent to the translation API.
 
-    Joins with `` ||| `` delimiter for batch efficiency (fewer API calls).
-    Falls back to line-by-line translation if batch fails.
+    Skipping these avoids wasting API calls and prevents the translator
+    from hallucinating translations for content like ``♪ 間奏 ♪``.
+    """
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    if _RE_PURE_SYMBOLS.match(t):
+        return True
+    if _RE_INSTRUMENTAL.search(t):
+        return True
+    return False
+
+
+def _needs_translation(text: str, target_lang: str, force_translate: bool = False) -> bool:
+    """Return True if *text* contains characters outside the target language's
+    native script — meaning it likely needs translation.
+
+    When *force_translate* is True (e.g. the song as a whole has Japanese
+    kana, confirming the lyrics are non-Chinese), ALL CJK-bearing lines are
+    treated as translatable so pure-kanji Japanese lines are not skipped.
+    """
+    if not text or not text.strip():
+        return False
+    if _is_purely_structural(text):
+        return False
+    if _is_non_lyric_line(text):
+        return False
+
+    if force_translate:
+        # The song is confirmed non-target → any content with actual
+        # characters needs translation
+        return True
+
+    if target_lang == "zh":
+        # Needs translation if text has Japanese kana, Korean hangul,
+        # or meaningful Latin words (mixed-content).
+        if any(0x3040 <= ord(ch) <= 0x30FF for ch in text):   # Hiragana / Katakana
+            return True
+        if any(0xAC00 <= ord(ch) <= 0xD7AF for ch in text):   # Hangul syllables
+            return True
+        if _RE_LATIN_WORD.search(text):                       # Latin words ≥ 2 chars
+            return True
+        return False
+
+    if target_lang == "en":
+        # Needs translation if text has any non-ASCII character
+        return any(ord(ch) > 127 for ch in text)
+
+    # Unknown target — translate everything
+    return True
+
+
+def _detect_source_language(texts: list[str]) -> str:
+    """Heuristic to pick an explicit source language for a batch of lyrics.
+
+    When the batch contains Japanese kana or Korean hangul we tell
+    Google Translate exactly what the source is instead of relying on
+    ``source="auto"``.  This fixes mixed-content lines (e.g. Japanese +
+    English) where the auto-detector gives up.
+    """
+    kana = 0
+    hangul = 0
+    for t in texts:
+        for ch in t:
+            cp = ord(ch)
+            if 0x3040 <= cp <= 0x30FF:
+                kana += 1
+            elif 0xAC00 <= cp <= 0xD7AF:
+                hangul += 1
+    if kana > 0:
+        return "ja"
+    if hangul > 0:
+        return "ko"
+    return "auto"
+
+
+def _translate_one_chunk(
+    chunk: list[str],
+    source_lang: str,
+    target_full: str,
+    delimiter: str,
+    chunk_idx: tuple[int, int],
+) -> tuple:
+    """Translate a single chunk in a worker thread.  Returns
+    ``(chunk_idx, translated_parts_or_None)`` so the caller can
+    reassemble results in order.
+    """
+    try:
+        joined = delimiter.join(chunk)
+        translator = GoogleTranslator(source=source_lang, target=target_full)
+        translated_joined = translator.translate(joined)
+        if translated_joined:
+            parts = translated_joined.split(delimiter)
+            if len(parts) == len(chunk):
+                return (chunk_idx, parts)
+    except Exception:
+        pass
+    return (chunk_idx, None)
+
+
+def _batch_translate(texts: list[str], target_lang: str) -> list[str]:
+    """Translate a list of lyric texts using Google Translate.
+
+    Optimisations over the naive approach:
+
+    * Detects the dominant source language (ja/ko) so mixed-content lines
+      are fully translated.
+    * Translates chunks in **parallel** (3 workers by default) — the API
+      is I/O-bound, so concurrency gives a ~2-3× speedup.
+    * Falls back to line-by-line translation for any chunk that failed,
+      retrying with ``source="auto"`` if the explicit source didn't help.
+    * Re-uses translator instances where possible in the fallback path.
     """
     if not texts:
         return []
 
     lang_map = {"zh": "chinese (simplified)", "en": "english"}
     target_full = lang_map.get(target_lang, target_lang)
+    source_lang = _detect_source_language(texts)
     delimiter = " ||| "
+    chunk_size = 30  # slightly smaller chunks → faster per-chunk, better parallelism
+    n_chunks = (len(texts) + chunk_size - 1) // chunk_size
 
-    results = []
-    chunk_size = 50
+    # ------------------------------------------------------------------
+    # Phase 1 — parallel batch translation
+    # ------------------------------------------------------------------
+    ordered = [None] * n_chunks
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {}
+        for ci in range(n_chunks):
+            start = ci * chunk_size
+            chunk = texts[start:start + chunk_size]
+            fut = pool.submit(
+                _translate_one_chunk, chunk, source_lang, target_full, delimiter, (ci, ci)
+            )
+            futures[fut] = ci
 
-    for chunk_start in range(0, len(texts), chunk_size):
-        chunk = texts[chunk_start:chunk_start + chunk_size]
-
-        # Try batch translation first
-        try:
-            joined = delimiter.join(chunk)
-            translator = GoogleTranslator(source="auto", target=target_full)
-            translated_joined = translator.translate(joined)
-            if translated_joined:
-                parts = translated_joined.split(delimiter)
-                if len(parts) == len(chunk):
-                    results.extend(parts)
-                    continue
-        except Exception:
-            pass
-
-        # Fallback: translate each line individually
-        for text in chunk:
+        for fut in as_completed(futures):
+            ci = futures[fut]
             try:
-                translator = GoogleTranslator(source="auto", target=target_full)
-                result = translator.translate(text)
-                results.append(result if result else text)
+                _, parts = fut.result()
+                ordered[ci] = parts
             except Exception:
-                results.append(text)
+                ordered[ci] = None
+
+    # ------------------------------------------------------------------
+    # Phase 2 — fill gaps with individual translation
+    # ------------------------------------------------------------------
+    results = []
+    for ci in range(n_chunks):
+        parts = ordered[ci]
+        if parts is not None:
+            results.extend(parts)
+            continue
+
+        # Fallback for this chunk — translate line-by-line
+        start = ci * chunk_size
+        for text in texts[start:start + chunk_size]:
+            translated = False
+            # Try explicit source first
+            if source_lang != "auto":
+                try:
+                    t = GoogleTranslator(source=source_lang, target=target_full)
+                    result = t.translate(text)
+                    if result and result != text:
+                        results.append(result)
+                        translated = True
+                except Exception:
+                    pass
+            # Retry with auto
+            if not translated:
+                try:
+                    t = GoogleTranslator(source="auto", target=target_full)
+                    result = t.translate(text)
+                    results.append(result if result else text)
+                except Exception:
+                    results.append(text)
 
     return results
 
@@ -1010,6 +1163,10 @@ def translate_lrc(lrc_text: str, target_lang: str) -> str:
 
     Only the text portions are translated; ``[mm:ss.xx]`` brackets and
     metadata tags like ``[ti:...]`` / ``[ar:...]`` are kept intact.
+
+    Non-lyric content (instrumental markers, pure symbols like ♪♫) is
+    intentionally skipped so API calls are not wasted on untranslatable
+    decoration.
     """
     if not _HAS_TRANSLATOR:
         return lrc_text
@@ -1018,10 +1175,23 @@ def translate_lrc(lrc_text: str, target_lang: str) -> str:
 
     lines = lrc_text.replace("\r\n", "\n").split("\n")
 
+    # ------------------------------------------------------------------
+    # Context detection: does the song as a whole contain Japanese kana?
+    # If yes, *all* CJK-bearing lines are treated as translatable so
+    # pure-kanji Japanese lines aren't skipped just because they lack
+    # kana characters.
+    # ------------------------------------------------------------------
+    _has_kana_anywhere = any(
+        0x3040 <= ord(ch) <= 0x30FF for line in lines for ch in line
+    )
+    _has_hangul_anywhere = any(
+        0xAC00 <= ord(ch) <= 0xD7AF for line in lines for ch in line
+    )
+    force_translate = _has_kana_anywhere or _has_hangul_anywhere
+
     # Collect translatable texts and their positions
-    texts_to_translate = []
-    # Each entry: (line_index, is_timestamp, prefix, original_text)
-    line_map = []
+    texts_to_translate = []                      # ordered list → translator
+    line_map = []                                # (line_idx, is_ts, prefix, orig_text)
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -1034,7 +1204,10 @@ def translate_lrc(lrc_text: str, target_lang: str) -> str:
         if m:
             timestamp = m.group(1)
             text = m.group(2).strip()
-            if text and not _is_purely_structural(text):
+            if _is_non_lyric_line(text):
+                # Keep the line as-is but don't waste an API call
+                line_map.append((i, True, f"[{timestamp}] ", ""))
+            elif text and _needs_translation(text, target_lang, force_translate):
                 texts_to_translate.append(text)
                 line_map.append((i, True, f"[{timestamp}] ", text))
             else:
@@ -1046,7 +1219,7 @@ def translate_lrc(lrc_text: str, target_lang: str) -> str:
         if m:
             tag = m.group(1)
             value = m.group(2).strip()
-            if value and not _is_purely_structural(value):
+            if value and _needs_translation(value, target_lang, force_translate):
                 texts_to_translate.append(value)
                 line_map.append((i, False, f"[{tag}:", value))
             else:

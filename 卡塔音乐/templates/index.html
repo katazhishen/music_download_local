@@ -92,6 +92,10 @@
     <div class="p-title" id="playerTitle">未在播放</div>
     <div class="p-artist" id="playerArtist">—</div>
   </div>
+  <div class="player-lyrics" id="playerLyrics">
+    <div class="player-lyrics-line player-lyrics-current" id="playerLyricsCurrent"></div>
+    <div class="player-lyrics-line player-lyrics-next" id="playerLyricsNext"></div>
+  </div>
   <div class="player-controls">
     <button onclick="playerPrev()" title="上一首">⏮</button>
     <button class="play-btn" id="playerPlayBtn" onclick="playerToggle()">▶️</button>
@@ -111,6 +115,20 @@
 <div class="toast" id="toast"></div>
 
 <script src="{{ url_for("static", filename="js/app.js") }}"></script>
+
+<button class="back-to-top" id="backToTop" title="回到顶部" aria-label="回到顶部" onclick="scrollToTop()">⬆</button>
+
+<div class="lyrics-modal-overlay" id="lyricsModal" onclick="closeLyricsModal(event)">
+  <div class="lyrics-modal-dialog">
+    <div class="lyrics-modal-header">
+      <span class="lyrics-modal-title" id="lyricsModalTitle">歌词预览</span>
+      <button class="lyrics-modal-close" onclick="closeLyricsModal()" title="关闭">&times;</button>
+    </div>
+    <div class="lyrics-modal-body" id="lyricsModalBody">
+      <div style="text-align:center;padding:20px;color:#8c8c8c;"><div class="spinner"></div><p>加载歌词中...</p></div>
+    </div>
+  </div>
+</div>
 
 <div class="about-overlay" id="aboutOverlay" onclick="closeAbout(event)">
   <div class="about-dialog">

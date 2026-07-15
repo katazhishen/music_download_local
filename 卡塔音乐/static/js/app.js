@@ -10,6 +10,172 @@ let currentSong = null;  // {songId, platform, title, artist, cover}
 
 let playlist = [], playIdx = -1;
 
+// Translation cache: preview → download flow
+// Key: "songId@platform@lang" → {text, timer}
+var lrcCache = {};
+var lrcCacheKeys = [];  // ordered by insertion (oldest first), max 3
+
+function cacheLrc(songId, platform, lang, text) {
+  var key = songId + '@' + platform + '@' + lang;
+  // Clear previous cache for same key if exists
+  if (lrcCache[key]) {
+    clearTimeout(lrcCache[key].timer);
+    var idx = lrcCacheKeys.indexOf(key);
+    if (idx >= 0) lrcCacheKeys.splice(idx, 1);
+  }
+  // Enforce max 3 entries (FIFO eviction)
+  while (lrcCacheKeys.length >= 3) {
+    var oldest = lrcCacheKeys.shift();
+    clearTimeout(lrcCache[oldest].timer);
+    delete lrcCache[oldest];
+  }
+  // Auto-expire after 30 seconds
+  var timer = setTimeout(function() {
+    var i = lrcCacheKeys.indexOf(key);
+    if (i >= 0) lrcCacheKeys.splice(i, 1);
+    delete lrcCache[key];
+  }, 30000);
+  lrcCache[key] = { text: text, timer: timer };
+  lrcCacheKeys.push(key);
+}
+
+function getCachedLrc(songId, platform, lang) {
+  var key = songId + '@' + platform + '@' + lang;
+  var entry = lrcCache[key];
+  if (!entry) return null;
+  // Consume cache — clear timer and remove entry
+  clearTimeout(entry.timer);
+  var i = lrcCacheKeys.indexOf(key);
+  if (i >= 0) lrcCacheKeys.splice(i, 1);
+  delete lrcCache[key];
+  return entry.text;
+}
+
+function clearSongLrcCache(songId, platform) {
+  var prefix = songId + '@' + platform + '@';
+  for (var k in lrcCache) {
+    if (lrcCache.hasOwnProperty(k) && k.indexOf(prefix) === 0) {
+      clearTimeout(lrcCache[k].timer);
+      var i = lrcCacheKeys.indexOf(k);
+      if (i >= 0) lrcCacheKeys.splice(i, 1);
+      delete lrcCache[k];
+    }
+  }
+}
+
+// Global raw lyrics cache — preloaded when a song plays, shared with preview/download
+// Key: "songId@platform" → {lines:[{time,text}], loaded:bool, raw:string}
+var lyricsDataCache = {};
+
+function getLyricsCacheKey(songId, platform) {
+  return songId + '@' + platform;
+}
+
+function parseLrcToLines(lrcText) {
+  if (!lrcText) return [];
+  var lines = lrcText.split('\n');
+  var result = [];
+  for (var i = 0; i < lines.length; i++) {
+    var match = lines[i].match(/^\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)/);
+    if (match) {
+      var mins = parseInt(match[1], 10);
+      var secs = parseInt(match[2], 10);
+      var ms = parseInt(match[3], 10);
+      if (match[3].length === 2) ms *= 10;
+      var time = mins * 60 + secs + ms / 1000;
+      var text = match[4].trim();
+      if (text) result.push({ time: time, text: text });
+    }
+  }
+  return result;
+}
+
+async function ensureLyricsLoaded(songId, platform) {
+  var key = getLyricsCacheKey(songId, platform);
+  if (lyricsDataCache[key] && lyricsDataCache[key].loaded) {
+    return lyricsDataCache[key];
+  }
+
+  // Mark as loading to prevent duplicate requests
+  if (!lyricsDataCache[key]) {
+    lyricsDataCache[key] = { lines: [], loaded: false, raw: '' };
+  }
+
+  try {
+    var resp = await fetch('/api/lyrics/' + platform + '/' + songId);
+    var data = await resp.json();
+    var lrcText = (data && data.lyric) ? data.lyric : '';
+    var lines = parseLrcToLines(lrcText);
+    lyricsDataCache[key] = { lines: lines, loaded: true, raw: lrcText };
+    return lyricsDataCache[key];
+  } catch(e) {
+    lyricsDataCache[key] = { lines: [], loaded: true, raw: '' };
+    return lyricsDataCache[key];
+  }
+}
+
+function updatePlayerLyrics(currentTime) {
+  var elCur = document.getElementById('playerLyricsCurrent');
+  var elNext = document.getElementById('playerLyricsNext');
+  if (!elCur || !elNext) return;
+  if (!currentSong) { elCur.textContent = ''; elNext.textContent = ''; return; }
+
+  var key = getLyricsCacheKey(currentSong.songId, currentSong.platform);
+  var cache = lyricsDataCache[key];
+  if (!cache || !cache.loaded || !cache.lines.length) {
+    elCur.textContent = ''; elNext.textContent = ''; return;
+  }
+
+  var lines = cache.lines;
+  var curIdx = -1;
+  for (var i = lines.length - 1; i >= 0; i--) {
+    if (currentTime >= lines[i].time) { curIdx = i; break; }
+  }
+
+  var curText = curIdx >= 0 ? lines[curIdx].text : '';
+  var nextText = (curIdx >= 0 && curIdx + 1 < lines.length) ? lines[curIdx + 1].text : '';
+
+  // ── Current line: two-step non-linear scroll ──
+  if (elCur.dataset.text !== curText) {
+    // Step 1 — exit: slide up + fade out (fast)
+    elCur.style.opacity = '0';
+    elCur.style.transform = 'translateY(-14px)';
+    elCur.style.transitionDuration = '0.14s';
+
+    setTimeout(function() {
+      // Step 2 — entry: slide from below + overshoot settle
+      elCur.dataset.text = curText;
+      elCur.textContent = curText;
+      elCur.style.transform = 'translateY(10px)';
+      elCur.style.transitionDuration = '0.28s';
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() {
+          elCur.style.opacity = '1';
+          elCur.style.transform = 'translateY(0)';
+        });
+      });
+    }, 150);
+  }
+
+  // ── Next line: dimmer, staggered behind current ──
+  if (elNext.dataset.text !== nextText) {
+    setTimeout(function() {
+      elNext.dataset.text = nextText;
+      elNext.style.opacity = '0';
+      elNext.style.transform = 'translateY(8px)';
+      elNext.style.transitionDuration = '0.12s';
+      elNext.textContent = nextText;
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() {
+          elNext.style.opacity = '';   // back to CSS default (0.45)
+          elNext.style.transform = 'translateY(0)';
+          elNext.style.transitionDuration = '0.28s';
+        });
+      });
+    }, 40);  // slight stagger after current line starts
+  }
+}
+
 // ============================================================
 // Init
 // ============================================================
@@ -39,6 +205,8 @@ audio.addEventListener('timeupdate', function() {
   seek.value = pct;
   seek.style.setProperty('--seek-pct', pct + '%');
   document.getElementById('playerCurTime').textContent = fmtTime(audio.currentTime);
+  // Update scrolling lyrics in player bar
+  updatePlayerLyrics(audio.currentTime);
 });
 audio.addEventListener('loadedmetadata', function() {
   document.getElementById('playerDur').textContent = fmtTime(audio.duration);
@@ -88,6 +256,7 @@ document.addEventListener('keydown', function(e) {
       break;
     case 'Escape':
       e.preventDefault();
+      closeLyricsModal();
       closeAbout(e);
       break;
     case 'Slash':
@@ -145,7 +314,7 @@ function fmtTime(s) { if (!s||isNaN(s)) return '00:00'; const m=Math.floor(s/60)
 function switchSort(sort, btn) {
   curSort = sort;
   curSection = 'search';
-  document.querySelectorAll('.mode-btn[data-sort]').forEach(function(b) { b.classList.remove('active'); });
+  document.querySelectorAll('.search-bar .mode-btn').forEach(function(b) { b.classList.remove('active'); });
   btn.classList.add('active');
   document.getElementById('searchInput').placeholder = '搜索歌曲、歌手...';
   // Restore search view
@@ -173,6 +342,14 @@ function switchSort(sort, btn) {
 function switchSection(s) {
   curSection = s;
   var isNcm = s === 'ncm';
+  document.querySelectorAll('.search-bar .mode-btn').forEach(function(b) { b.classList.remove('active'); });
+  if (isNcm) {
+    var ncmBtn = document.querySelector('.search-bar .mode-btn:not([data-sort])');
+    if (ncmBtn) ncmBtn.classList.add('active');
+  } else {
+    var activeSortBtn = document.querySelector('.search-bar .mode-btn[data-sort="'+curSort+'"]');
+    if (activeSortBtn) activeSortBtn.classList.add('active');
+  }
   document.getElementById('ncmZone').style.display = isNcm ? 'block' : 'none';
   document.getElementById('songList').style.display = isNcm ? 'none' : '';
   document.getElementById('emptyState').style.display = isNcm ? 'none' : (playlist && playlist.length ? 'none' : 'block');
@@ -190,8 +367,19 @@ async function doSearch(page) {
   curQuery = q; curPage = page; curSection = 'search';
   document.getElementById('loadingArea').style.display = 'block';
   document.getElementById('emptyState').style.display = 'none';
-  document.getElementById('songList').innerHTML = '';
   document.getElementById('ncmZone').style.display = 'none';
+
+  var skeletonHtml = '';
+  for (var i = 0; i < 5; i++) {
+    skeletonHtml += '<li class="song-item"><div class="skeleton-row">' +
+      '<div class="skeleton-cover"></div>' +
+      '<div style="flex:1">' +
+        '<div class="skeleton-line medium" style="margin-bottom:6px"></div>' +
+        '<div class="skeleton-line short"></div>' +
+      '</div></div></li>';
+  }
+  document.getElementById('songList').innerHTML = skeletonHtml;
+  document.getElementById('songList').classList.add('skeleton-list');
 
   try {
     const resp = await fetch('/api/search?q='+encodeURIComponent(q)+'&platform='+curPlatform+'&filter=name&page='+page);
@@ -206,6 +394,7 @@ async function doSearch(page) {
     document.getElementById('songList').innerHTML = '<div class="error-box"><h3>搜索失败</h3><p>'+esc(e.message)+'</p></div>';
   } finally {
     document.getElementById('loadingArea').style.display = 'none';
+    document.getElementById('songList').classList.remove('skeleton-list');
   }
 }
 
@@ -307,7 +496,7 @@ async function fetchCoverForSong(songId, platform, title, artist) {
   } catch(e) {}
 }
 
-async function toggleSong(songId, platform, idx) {
+async function toggleSong(songId, platform, idx, shouldAutoPlay) {
   const item = document.getElementById('song-'+songId);
   const detail = document.getElementById('detail-'+songId);
   if (item.classList.contains('expanded')) { item.classList.remove('expanded'); return; }
@@ -321,13 +510,14 @@ async function toggleSong(songId, platform, idx) {
 
   // Show player bar and update info
   document.getElementById('playerBar').classList.add('visible');
+  var container = document.querySelector('.container');
+  if (container) container.classList.add('player-visible');
   playIdx = idx;
   var song = playlist[idx];
   if (song) {
     currentSong = {songId: songId, platform: platform, title: song.title, artist: song.artist, cover: song.cover||'', duration: song.duration||0};
     document.getElementById('playerTitle').textContent = song.title || 'Unknown';
     document.getElementById('playerArtist').textContent = song.artist || 'Unknown';
-    // Show duration from search result
     var durMs = song.duration || 0;
     document.getElementById('playerDur').textContent = fmtTime(durMs / 1000);
     document.getElementById('playerCurTime').textContent = '00:00';
@@ -345,13 +535,16 @@ async function toggleSong(songId, platform, idx) {
     }
   }
 
+  updatePlayingIndicator(songId);
+
+  // Preload lyrics in background for instant preview/download
+  ensureLyricsLoaded(songId, platform);
+
   if (detail.dataset.loaded!=='1') {
     try {
       const song = playlist[idx];
       const lrc = song.lyric || '';
-      const tEnc = encodeURIComponent(song.title||'');
-      const aEnc = encodeURIComponent(song.artist||'');
-      detail.innerHTML =
+      detail.innerHTML = '<div>'+
         '<div class="detail-actions">'+
           '<button class="btn btn-primary dl-btn" data-sid="'+songId+'" data-plat="'+platform+'">⬇ 下载 MP3</button>'+
           '<button class="btn btn-outline btn-sm lrc-btn" data-sid="'+songId+'" data-plat="'+platform+'">📝 下载LRC歌词</button>'+
@@ -360,14 +553,14 @@ async function toggleSong(songId, platform, idx) {
             '<option value="zh">翻译为中文</option>'+
             '<option value="en">翻译为英文</option>'+
           '</select>'+
-          (lrc ? '<button class="btn btn-outline btn-sm" onclick="toggleLyrics(\''+songId+'\')">👁 预览歌词</button>' : '')+
+          '<button class="btn btn-outline btn-sm" onclick="fetchAndPreviewLyrics(\''+songId+'\',\''+platform+'\')">👁 预览歌词</button>'+
         '</div>'+
         '<div class="lrc-progress" id="lrc-progress-'+songId+'"><div class="bar"></div><div class="label">翻译中...</div></div>'+
         '<div class="detail-url">ID: '+songId+' | <a href="'+(song.link||'#')+'" target="_blank">源页面 ↗</a></div>'+
-        (lrc ? '<div class="lyrics-panel" id="lyrics-'+songId+'">'+esc(lrc).replace(/\n/g,'<br>')+'</div>' : '');
+        '<div class="lyrics-panel" id="lyrics-'+songId+'"'+(lrc?' data-fetched="1"':'')+'>'+(lrc?esc(lrc).replace(/\n/g,'<br>'):'')+'</div>'+
+        '</div>';
       detail.dataset.loaded = '1';
 
-      // Attach event listeners
       detail.querySelector('.dl-btn').addEventListener('click', function() {
         downloadSong(songId, platform, song.title, song.artist);
       });
@@ -375,12 +568,94 @@ async function toggleSong(songId, platform, idx) {
         downloadLrc(songId, platform, song.title, song.artist);
       });
     } catch(e) {
-      detail.innerHTML = '<div class="error-box">加载失败: '+esc(e.message)+'</div>';
+      detail.innerHTML = '<div><div class="error-box">加载失败: '+esc(e.message)+'</div></div>';
     }
+  }
+
+  if (shouldAutoPlay !== false) {
+    playCurrentSong(true);
+    var songEl = document.getElementById('song-'+songId);
+    if (songEl) songEl.scrollIntoView({behavior:'smooth',block:'center'});
   }
 }
 
 function toggleLyrics(songId) { document.getElementById('lyrics-'+songId).classList.toggle('show'); }
+
+async function fetchAndPreviewLyrics(songId, platform) {
+  var modal = document.getElementById('lyricsModal');
+  var titleEl = document.getElementById('lyricsModalTitle');
+  var bodyEl = document.getElementById('lyricsModalBody');
+
+  // Find song info from playlist
+  var songTitle = '', songArtist = '';
+  for (var i = 0; i < playlist.length; i++) {
+    if (playlist[i].id === songId && playlist[i].platform === platform) {
+      songTitle = playlist[i].title || '';
+      songArtist = playlist[i].artist || '';
+      break;
+    }
+  }
+
+  // Check if translation language is selected in the detail dropdown
+  var detailEl = document.getElementById('detail-'+songId);
+  var sel = detailEl ? detailEl.querySelector('.lrc-lang-select') : null;
+  var translateLang = sel ? sel.value : '';
+
+  // Show modal with loading state
+  var loadingMsg = translateLang ? '正在翻译歌词...' : '加载歌词中...';
+  titleEl.textContent = (songTitle ? songTitle + ' - ' + songArtist : '歌词预览');
+  bodyEl.innerHTML = '<div style="text-align:center;padding:40px 20px;color:#8c8c8c;"><div class="spinner"></div><p>'+loadingMsg+'</p></div>';
+  modal.classList.add('show');
+
+  try {
+    var lrcText = '';
+
+    if (translateLang) {
+      // Build translation URL (same pattern as downloadLrc)
+      var url = '/api/lrc/'+platform+'/'+songId;
+      if (songTitle && songTitle !== 'Unknown') {
+        url += '?title='+encodeURIComponent(songTitle)+'&artist='+encodeURIComponent(songArtist||'');
+      }
+      url += (url.indexOf('?')>=0 ? '&' : '?') + 'translate='+encodeURIComponent(translateLang);
+
+      // Show translation progress bar
+      bodyEl.innerHTML = '<div style="text-align:center;padding:40px 20px;color:#8c8c8c;">'+
+        '<div class="spinner"></div>'+
+        '<p>正在翻译歌词，请耐心等待...</p>'+
+        '<div class="lrc-progress active" style="max-width:240px;margin:12px auto 0"><div class="bar"></div><div class="label" style="display:block">翻译中...</div></div>'+
+        '</div>';
+
+      var resp = await fetch(url);
+      if (!resp.ok) {
+        var errData = null;
+        try { errData = await resp.json(); } catch(e) {}
+        throw new Error((errData && errData.error) || '翻译失败 (HTTP '+resp.status+')');
+      }
+      var blob = await resp.blob();
+      lrcText = await blob.text();
+
+      // Cache for potential download
+      cacheLrc(songId, platform, translateLang, lrcText);
+
+      // Update title to show translation language
+      var langLabel = translateLang==='zh' ? '中文' : '英文';
+      titleEl.textContent = (songTitle ? songTitle + ' - ' + songArtist : '歌词预览') + ' [' + langLabel + ']';
+    } else {
+      // No translation — use global lyrics cache if available
+      var cacheEntry = await ensureLyricsLoaded(songId, platform);
+      lrcText = cacheEntry.raw || '暂无歌词';
+    }
+
+    bodyEl.innerHTML = esc(lrcText).replace(/\n/g,'<br>');
+  } catch(e) {
+    bodyEl.innerHTML = '<div style="text-align:center;padding:40px 20px;color:#ffa39e;">加载失败: '+esc(e.message)+'</div>';
+  }
+}
+
+function closeLyricsModal(e) {
+  if (e && e.target !== e.currentTarget) return;
+  document.getElementById('lyricsModal').classList.remove('show');
+}
 
 async function downloadLrc(songId, platform, title, artist) {
   // Find the associated language selector
@@ -393,8 +668,31 @@ async function downloadLrc(songId, platform, title, artist) {
   if (translateLang) url += '&translate='+encodeURIComponent(translateLang);
 
   if (translateLang) {
-    // Translation route: use fetch so we can show progress
     var progressEl = document.getElementById('lrc-progress-'+songId);
+    var langLabel = translateLang==='zh' ? '中文' : '英文';
+
+    // Check if translation is already cached from preview
+    var cached = getCachedLrc(songId, platform, translateLang);
+    if (cached) {
+      // Use cached translation — skip server round-trip
+      if (progressEl) {
+        progressEl.classList.add('active');
+        progressEl.querySelector('.label').textContent = '使用缓存，开始下载...';
+      }
+      var cBlob = new Blob([cached], { type: 'text/plain;charset=utf-8' });
+      var ca = document.createElement('a');
+      ca.href = URL.createObjectURL(cBlob);
+      ca.download = (title && title !== 'Unknown' ? title : 'song') + '.lrc';
+      document.body.appendChild(ca); ca.click(); document.body.removeChild(ca);
+      URL.revokeObjectURL(ca.href);
+      if (progressEl) { progressEl.classList.remove('active'); }
+      toast('✅ 翻译完成 ('+langLabel+')，LRC 已下载（使用缓存）');
+      return;
+    }
+
+    // Cache miss — clear any stale cache for this song (different lang) and fetch fresh
+    clearSongLrcCache(songId, platform);
+
     if (progressEl) {
       progressEl.classList.add('active');
       progressEl.querySelector('.label').textContent = '翻译中...';
@@ -430,7 +728,6 @@ async function downloadLrc(songId, platform, title, artist) {
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       URL.revokeObjectURL(a.href);
 
-      var langLabel = translateLang==='zh' ? '中文' : '英文';
       toast('✅ 翻译完成 ('+langLabel+')，LRC 已下载');
     } catch(e) {
       toast('❌ 翻译失败: '+e.message);
@@ -438,12 +735,26 @@ async function downloadLrc(songId, platform, title, artist) {
       if (progressEl) progressEl.classList.remove('active');
     }
   } else {
-    // No translation: original direct download behavior
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = '';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    toast('📝 LRC 歌词下载已开始');
+    // No translation — try global lyrics cache first, fall back to direct download
+    var cacheKey = getLyricsCacheKey(songId, platform);
+    var rawCache = lyricsDataCache[cacheKey];
+    if (rawCache && rawCache.loaded && rawCache.raw) {
+      // Use cached raw lyrics — skip server round-trip
+      var rBlob = new Blob([rawCache.raw], { type: 'text/plain;charset=utf-8' });
+      var ra = document.createElement('a');
+      ra.href = URL.createObjectURL(rBlob);
+      ra.download = (title && title !== 'Unknown' ? title : 'song') + '.lrc';
+      document.body.appendChild(ra); ra.click(); document.body.removeChild(ra);
+      URL.revokeObjectURL(ra.href);
+      toast('📝 LRC 歌词已下载（使用缓存）');
+    } else {
+      // Fall back to direct server download
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = '';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      toast('📝 LRC 歌词下载已开始');
+    }
   }
 }
 
@@ -513,16 +824,20 @@ async function playerToggle() {
   }
 }
 
-async function playCurrentSong() {
+async function playCurrentSong(silent) {
   if (!currentSong) return;
   var cs = currentSong;
-  toast('正在获取音源...');
+  if (!silent) toast('正在获取音源...');
+  // Clear old lyrics display & preload lyrics for this song
+  document.getElementById('playerLyricsCurrent').textContent = '';
+  document.getElementById('playerLyricsNext').textContent = '';
+  ensureLyricsLoaded(cs.songId, cs.platform);
+  document.getElementById('playerBar').classList.add('loading');
   try {
     var resp = await fetch('/api/p/'+cs.songId+'?platform='+cs.platform+'&id='+cs.songId);
     var data = await resp.json();
     if (data.success && data.url) {
       audio.src = data.url;
-      // Respect seek bar position
       var seek = document.getElementById('playerSeek');
       var seekPct = parseFloat(seek.value) || 0;
       if (seekPct > 0) {
@@ -537,15 +852,18 @@ async function playCurrentSong() {
           audio.addEventListener('loadedmetadata', onMeta);
         });
       }
-      audio.play().catch(function(e){toast('播放失败: '+e.message)});
+      audio.play().catch(function(e){ if (!silent) toast('播放失败: '+e.message); });
       document.getElementById('playerTitle').textContent = cs.title;
       document.getElementById('playerArtist').textContent = cs.artist;
-      toast('▶ 正在播放: ' + cs.title);
+      if (!silent) toast('▶ 正在播放: ' + cs.title);
+      updatePlayingIndicator(cs.songId);
     } else {
-      toast('⚠ 暂无可用音源，请再次点击播放按钮重试');
+      if (!silent) toast('⚠ 暂无可用音源，请再次点击播放按钮重试');
     }
   } catch(e) {
-    toast('❌ 获取失败，请再次点击播放按钮重试');
+    if (!silent) toast('❌ 获取失败，请再次点击播放按钮重试');
+  } finally {
+    document.getElementById('playerBar').classList.remove('loading');
   }
 }
 
@@ -561,6 +879,39 @@ function playerSeekTo(v) {
   }
 }
 function playerSetVol(v) { audio.volume = v/100; }
+
+function updatePlayingIndicator(songId) {
+  document.querySelectorAll('.song-item.playing').forEach(function(el) {
+    el.classList.remove('playing');
+  });
+  if (songId) {
+    var el = document.getElementById('song-'+songId);
+    if (el) el.classList.add('playing');
+  }
+}
+
+var scrollTicking = false;
+window.addEventListener('scroll', function() {
+  if (!scrollTicking) {
+    window.requestAnimationFrame(function() {
+      var btn = document.getElementById('backToTop');
+      if (btn) {
+        if (window.scrollY > 400) {
+          btn.classList.add('visible');
+        } else {
+          btn.classList.remove('visible');
+        }
+      }
+      scrollTicking = false;
+    });
+    scrollTicking = true;
+  }
+}, { passive: true });
+
+function scrollToTop() {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
 async function playerPrev() {
   // Find current song index in displayed playlist (default to playIdx)
   var idx = -1;
@@ -574,11 +925,9 @@ async function playerPrev() {
   if (idx < 0 && playIdx >= 0) idx = playIdx;
   if (idx <= 0 || !playlist.length) { toast('已是第一首'); return; }
   var prev = playlist[idx - 1];
-  await toggleSong(prev.id, prev.platform, idx - 1);
-  // Scroll target into view
+  await toggleSong(prev.id, prev.platform, idx - 1, false);
   var el = document.getElementById('song-'+prev.id);
   if (el) el.scrollIntoView({behavior:'smooth',block:'center'});
-  // Auto-play the switched song
   playerToggle();
 }
 async function playerNext() {
@@ -593,10 +942,9 @@ async function playerNext() {
   if (idx < 0 && playIdx >= 0) idx = playIdx;
   if (idx < 0 || idx >= playlist.length - 1 || !playlist.length) { toast('已是最后一首'); return; }
   var next = playlist[idx + 1];
-  await toggleSong(next.id, next.platform, idx + 1);
+  await toggleSong(next.id, next.platform, idx + 1, false);
   var el = document.getElementById('song-'+next.id);
   if (el) el.scrollIntoView({behavior:'smooth',block:'center'});
-  // Auto-play the switched song
   playerToggle();
 }
 
