@@ -182,6 +182,98 @@ input{background:#1f1f1f;color:#d9d9d9;border:1px solid #333}
 .back-to-top:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(250,140,22,0.5)}
 .player-bar.visible~.back-to-top{bottom:80px}
 
+/* Player queue button (far right of player bar) */
+.player-queue-btn{background:transparent;border:1px solid #333;color:#8c8c8c;cursor:pointer;font-size:18px;padding:6px 10px;border-radius:8px;transition:all .2s;flex-shrink:0;position:relative}
+.player-queue-btn:hover{color:#fa8c16;border-color:#fa8c16}
+.player-queue-btn.has-queue{color:#fa8c16;border-color:#fa8c16;animation:queue-pulse 2s ease-in-out infinite}
+@keyframes queue-pulse{0%,100%{box-shadow:0 0 0 rgba(250,140,22,0)}50%{box-shadow:0 0 8px rgba(250,140,22,.3)}}
+
+/* Queue tab view (main content area) */
+.queue-tab-header{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #262626;margin-bottom:12px;flex-wrap:wrap}
+.queue-tab-header>span{font-size:14px;font-weight:600;color:#d9d9d9}
+.queue-tab-count{font-size:12px;background:#262626;color:#8c8c8c;padding:2px 8px;border-radius:10px}
+.queue-tab-badge{font-size:10px;background:#fa8c16;color:#fff;padding:1px 6px;border-radius:8px;margin-left:2px;font-weight:600}
+.queue-tab-view .song-item{cursor:default}
+.queue-tab-view .song-row{cursor:pointer}
+
+/* Batch download progress */
+.batch-progress{margin-bottom:12px;padding:12px 16px;background:#1a1a1a;border:1px solid #262626;border-radius:10px}
+.batch-progress-bar{height:6px;background:#262626;border-radius:3px;overflow:hidden;margin-bottom:6px}
+.batch-progress-fill{height:100%;width:0%;background:linear-gradient(90deg,#fa8c16,#ffa940);border-radius:3px;transition:width .2s}
+.batch-progress-text{font-size:12px;color:#8c8c8c;text-align:center}
+
+/* Player mode button — sits inside player-controls, before prev */
+.player-controls .player-mode-btn{background:transparent;border:none;color:#8c8c8c;cursor:pointer;font-size:15px;padding:4px 2px;transition:color .15s;line-height:1}
+.player-controls .player-mode-btn:hover{color:#fa8c16}
+
+/* Queue panel — floats above player bar on the right */
+.queue-panel{position:fixed;bottom:75px;right:20px;width:380px;max-height:460px;background:rgba(26,26,26,0.96);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid #333;border-radius:14px;z-index:199;display:flex;flex-direction:column;transform:translateY(10px);opacity:0;pointer-events:none;transition:all .25s cubic-bezier(.4,0,.2,1);box-shadow:0 -4px 24px rgba(0,0,0,.5),0 8px 32px rgba(0,0,0,.4)}
+.queue-panel.show{transform:translateY(0);opacity:1;pointer-events:auto}
+.queue-panel::after{content:'';position:absolute;bottom:-7px;right:28px;width:12px;height:12px;background:#1a1a1a;border-right:1px solid #333;border-bottom:1px solid #333;transform:rotate(45deg)}
+.queue-panel-header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #262626;font-size:14px;font-weight:600;color:#d9d9d9;flex-shrink:0}
+.queue-count{font-size:11px;background:#262626;color:#8c8c8c;padding:2px 8px;border-radius:10px;margin-left:4px}
+.queue-import-btn{background:rgba(250,140,22,.1);border:1px solid #fa8c16;color:#fa8c16;cursor:pointer;font-size:11px;padding:4px 10px;border-radius:12px;margin-left:auto;transition:all .15s}
+.queue-import-btn:hover{background:#fa8c16;color:#fff}
+.queue-mode-label{font-size:11px;color:#fa8c16;cursor:pointer;padding:2px 8px;border-radius:10px;background:rgba(250,140,22,.08);border:1px solid transparent;transition:all .15s;white-space:nowrap;margin-left:6px}
+.queue-mode-label:hover{background:rgba(250,140,22,.15);border-color:#fa8c16}
+.queue-clear-btn{background:transparent;border:1px solid transparent;color:#595959;cursor:pointer;font-size:13px;padding:2px 6px;border-radius:6px;transition:all .15s}
+.queue-clear-btn:hover{color:#ff4d4f;border-color:#5c1a1a}
+
+/* Clear confirmation popup — floats above the clear button */
+.queue-clear-wrapper{position:relative}
+.queue-clear-confirm{position:absolute;bottom:100%;right:0;margin-bottom:8px;background:#1f1f1f;border:1px solid #333;border-radius:8px;padding:7px 9px;display:none;white-space:nowrap;z-index:10;box-shadow:0 -2px 14px rgba(0,0,0,.6);gap:7px;align-items:center}
+.queue-clear-confirm::after{content:'';position:absolute;top:100%;right:14px;border:6px solid transparent;border-top-color:#1f1f1f}
+.queue-clear-confirm.show{display:flex}
+.clear-confirm-yes{background:#ff4d4f;color:#fff;border:none;padding:4px 12px;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600;transition:all .15s}
+.clear-confirm-yes:hover{background:#ff7875}
+.clear-confirm-no{background:#333;color:#bfbfbf;border:none;padding:4px 12px;border-radius:5px;font-size:12px;cursor:pointer;transition:all .15s}
+.clear-confirm-no:hover{background:#444;color:#fff}
+.queue-list{flex:1;overflow-y:auto;overflow-x:hidden}
+.queue-list::-webkit-scrollbar{width:4px}
+.queue-list::-webkit-scrollbar-thumb{background:#333;border-radius:2px}
+.queue-empty{padding:32px 20px;text-align:center;color:#595959;font-size:13px}
+
+/* Queue item */
+.queue-item{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid #1f1f1f;cursor:pointer;transition:all .15s;position:relative}
+.queue-item:hover{background:rgba(250,140,22,.04)}
+.queue-item.playing{background:rgba(250,140,22,.08);border-left:3px solid #fa8c16}
+.queue-item.playing::before{content:'';position:absolute;left:0;top:0;bottom:0;width:100%;background:linear-gradient(90deg,rgba(250,140,22,.06),transparent 60%);pointer-events:none}
+.queue-idx{width:22px;text-align:center;font-size:11px;color:#595959;flex-shrink:0;font-weight:500}
+.queue-item.playing .queue-idx{color:#fa8c16;font-weight:700;font-size:12px}
+.queue-item.playing .queue-idx::before{content:'▶ ';font-size:8px}
+.queue-cover-sm{width:36px;height:36px;border-radius:4px;object-fit:cover;background:#262626;flex-shrink:0}
+.queue-info{flex:1;min-width:0}
+.queue-info .q-title{font-size:13px;color:#d9d9d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.queue-info .q-artist{font-size:11px;color:#8c8c8c;margin-top:1px}
+.queue-item.playing .queue-info .q-title{color:#fa8c16}
+.queue-tag{font-size:9px;background:#262626;color:#fa8c16;padding:1px 6px;border-radius:8px;flex-shrink:0}
+.queue-dur{font-size:10px;color:#595959;flex-shrink:0}
+.queue-item.playing .queue-dur{color:#8c8c8c}
+.queue-remove{background:none;border:none;color:#333;cursor:pointer;font-size:14px;padding:0 2px;transition:color .15s;flex-shrink:0;display:none}
+.queue-item:hover .queue-remove{display:block}
+.queue-remove:hover{color:#ff4d4f}
+
+/* Load-more indicator at bottom of queue list */
+.queue-load-more{padding:10px 16px;text-align:center;color:#fa8c16;font-size:12px;cursor:pointer;transition:all .15s;border-top:1px solid #262626}
+.queue-load-more:hover{background:rgba(250,140,22,.06);color:#ffa940}
+
+/* Import dialog */
+.queue-import-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1001;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .3s}
+.queue-import-overlay.show{opacity:1;pointer-events:auto}
+.queue-import-dialog{background:#1f1f1f;border:1px solid #333;border-radius:14px;max-width:460px;width:90%;transform:translateY(20px);transition:transform .3s;box-shadow:0 8px 40px rgba(0,0,0,.6)}
+.queue-import-overlay.show .queue-import-dialog{transform:translateY(0)}
+.queue-import-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #262626;font-size:15px;font-weight:600;color:#fa8c16}
+.queue-import-close{background:none;border:none;color:#8c8c8c;font-size:22px;cursor:pointer;padding:0 4px;line-height:1;transition:color .15s}
+.queue-import-close:hover{color:#fa8c16}
+.queue-import-body{padding:20px}
+.queue-import-body input[type=text]{width:100%;padding:12px 16px;border-radius:10px;font-size:14px;outline:none;border:1px solid #333;background:#141414;color:#d9d9d9;transition:border-color .2s;margin-bottom:8px}
+.queue-import-body input[type=text]:focus{border-color:#fa8c16}
+.queue-import-hint{font-size:11px;color:#595959;margin-bottom:16px;line-height:1.5}
+.queue-import-status{margin-top:12px;font-size:13px;text-align:center;min-height:20px}
+.queue-import-status.loading{color:#fa8c16}
+.queue-import-status.success{color:#52c41a}
+.queue-import-status.error{color:#ff4d4f}
+
 ::-webkit-scrollbar{width:6px}
 ::-webkit-scrollbar-track{background:#141414}
 ::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
@@ -225,4 +317,16 @@ input{background:#1f1f1f;color:#d9d9d9;border:1px solid #333}
   .toast{bottom:90px;font-size:12px;padding:6px 16px}
   .back-to-top{bottom:90px;right:12px;width:36px;height:36px;font-size:16px}
   .player-bar.visible~.back-to-top{bottom:72px}
+  .queue-panel{width:calc(100vw - 24px);right:12px;bottom:70px;max-height:340px;border-radius:12px}
+  .queue-panel::after{right:calc(50% - 6px)}
+  .player-controls .player-mode-btn{padding:8px 4px;font-size:13px;min-width:28px;display:flex;align-items:center;justify-content:center}
+  .player-queue-btn{padding:8px 10px;font-size:16px;min-width:40px;display:flex;align-items:center;justify-content:center}
+  .queue-mode-label{font-size:10px;padding:2px 6px}
+  .queue-import-btn{font-size:10px;padding:3px 8px}
+  .queue-import-dialog{max-width:95vw}
+  .queue-dur{display:none}
+  .queue-tag{font-size:8px;padding:1px 4px}
+  .queue-tab-header{gap:6px;padding:8px 0}
+  .queue-tab-header .btn{padding:6px 10px;font-size:11px}
+  .batch-progress-text{font-size:11px}
 }

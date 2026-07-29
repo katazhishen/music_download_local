@@ -5,11 +5,13 @@ import os
 import logging
 from pathlib import Path
 
+# Pre-compiled regexes
+_ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+
 
 def sanitize_filename(name: str) -> str:
     """Remove or replace characters illegal in Windows/Mac filenames."""
-    illegal = r'[<>:"/\\|?*]'
-    name = re.sub(illegal, "_", name)
+    name = _ILLEGAL_CHARS_RE.sub("_", name)
     name = name.strip(". ")
     if not name:
         name = "unknown"
@@ -23,7 +25,7 @@ def build_filename(artist: str, title: str, ext: str) -> str:
     """Build a clean filename: 'Artist - Title.ext'."""
     artist = sanitize_filename(artist) if artist else "Unknown Artist"
     title = sanitize_filename(title) if title else "Unknown Title"
-    ext = ext.lstrip(".")
+    ext = ext[1:] if ext.startswith(".") else ext
     return f"{artist} - {title}.{ext}"
 
 

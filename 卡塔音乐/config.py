@@ -38,7 +38,7 @@ class Config:
     HOST: str = os.environ.get("MD_HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("MD_PORT", "5000"))
     DEBUG: bool = os.environ.get("MD_DEBUG", "false").lower() in ("1", "true", "yes")
-    SECRET_KEY: str = os.environ.get("MD_SECRET_KEY", os.urandom(24).hex())
+    SECRET_KEY: str = os.environ.get("MD_SECRET_KEY") or os.urandom(24).hex()
 
     # --- Download ---
     MAX_CONTENT_LENGTH: int = (

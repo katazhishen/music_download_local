@@ -210,25 +210,47 @@ def _resolve_proxy_url(proxy_path: str) -> Optional[str]:
         The final CDN URL after redirect, or None.
     """
     full_url = urljoin(MYHKW_BASE, proxy_path)
+    fetch_headers = {**_HEADERS, "X-Requested-With": ""}
+
+    # Strategy 1: HEAD (fast, no download)
     try:
-        # Use HEAD + allow_redirects to follow the proxy without downloading
         resp = requests.head(
             full_url,
-            headers={**_HEADERS, "X-Requested-With": ""},  # not an XHR for audio
+            headers=fetch_headers,
             timeout=15,
             allow_redirects=True,
         )
         if resp.status_code == 200:
-            # Check if we got redirected to a CDN
             if "music.126.net" in resp.url or "music.163.com" in resp.url:
                 return resp.url
-            # Some proxies return the audio directly without redirect
             content_type = resp.headers.get("Content-Type", "")
             if "audio" in content_type:
-                return full_url  # Return the proxy URL itself (streams audio)
-        return None
+                return full_url
     except Exception:
-        return None
+        pass
+
+    # Strategy 2: GET with stream (some CDNs reject HEAD but accept GET)
+    try:
+        resp = requests.get(
+            full_url,
+            headers=fetch_headers,
+            timeout=15,
+            allow_redirects=True,
+            stream=True,
+        )
+        if resp.status_code == 200:
+            if "music.126.net" in resp.url or "music.163.com" in resp.url:
+                resp.close()
+                return resp.url
+            content_type = resp.headers.get("Content-Type", "")
+            if "audio" in content_type:
+                resp.close()
+                return full_url
+        resp.close()
+    except Exception:
+        pass
+
+    return None
 
 
 def _fetch_proxy_text(proxy_path: str) -> str:

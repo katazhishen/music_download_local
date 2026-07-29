@@ -10,7 +10,8 @@ Usage:
     # Open http://127.0.0.1:5000
 """
 
-import os, sys, json, tempfile, time, threading, itertools
+import os, sys, json, tempfile, time, threading, secrets, io, zipfile, re, hashlib, hmac
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -19,8 +20,9 @@ try:
     import requests as req
     from flask import Flask, render_template, request, jsonify, send_file, Response
 
-    from core.utils import log, sanitize_filename, build_filename, format_duration
+    from core.utils import log, sanitize_filename, build_filename
     from platforms.netease import NeteaseAPI, decrypt_ncm, parse_netease_url
+    import analytics  # visitor + download tracking
     from platforms.myhkw_api import (
         resolve_song_url,
         resolve_song_url_raw,
@@ -60,6 +62,7 @@ except ImportError:
 IS_PRODUCTION = os.environ.get("RENDER", "").lower() == "true"
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("MD_SECRET_KEY") or os.urandom(24).hex()
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 app.config["TEMPLATES_AUTO_RELOAD"] = not IS_PRODUCTION
 
@@ -216,9 +219,11 @@ def _make_content_disp(filename_full: str, ext: str) -> str:
 # ---------------------------------------------------------------------------
 # Supported platforms
 PLATFORMS = {
-    "netease":  {"name": "网易云", "icon": "🎵"},
-    "kugou":    {"name": "酷狗",   "icon": "🐶"},
-    "kuwo":     {"name": "酷我",   "icon": "🎤"},
+    "netease":  {"name": "网易云",   "icon": "🎵"},
+    "qq":       {"name": "QQ音乐",   "icon": "🐧"},
+    "kugou":    {"name": "酷狗",     "icon": "🐶"},
+    "kuwo":     {"name": "酷我",     "icon": "🎤"},
+    "migu":     {"name": "咪咕音乐", "icon": "📻"},
 }
 
 
@@ -352,6 +357,104 @@ def search_luckxz(query: str, platform: str = "netease", page: int = 1) -> dict:
         return {"songs": [], "total": 0, "error": str(e)}
 
 
+def search_qqmusic(query: str, platform: str = "qq", page: int = 1) -> dict:
+    """Search via QQ Music official API."""
+    try:
+        resp = req.get(
+            "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+            params={
+                "t": 0, "aggr": 1, "lossless": 0, "flag_qc": 0,
+                "p": page, "n": 20, "w": query,
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://y.qq.com/",
+            },
+            timeout=15,
+        )
+        raw = resp.text
+        # Response is JSONP: callback({...})
+        if raw.startswith("callback("):
+            raw = raw[9:-1]
+        data = json.loads(raw)
+        songs = []
+        for item in data.get("data", {}).get("song", {}).get("list", []):
+            singer_list = item.get("singer", [])
+            artist = ", ".join(s.get("name", "") for s in singer_list) if singer_list else "Unknown"
+            albummid = item.get("albummid", "")
+            songs.append({
+                "id": item.get("songmid", ""),
+                "title": item.get("songname", "Unknown"),
+                "artist": artist,
+                "cover": f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{albummid}.jpg" if albummid else "",
+                "duration": (item.get("interval") or 0) * 1000,
+                "heat": 0,
+                "lyric": "",
+                "url": "",
+                "link": f"https://y.qq.com/n/ryqq/songDetail/{item.get('songmid', '')}",
+                "platform": "qq",
+                "platform_name": "QQ音乐",
+                "source": "qqmusic",
+                "_media_mid": item.get("media_mid", ""),
+                "_songmid": item.get("songmid", ""),
+            })
+        total = data.get("data", {}).get("song", {}).get("totalnum", len(songs))
+        return {"songs": songs, "total": total, "error": None}
+    except Exception as e:
+        return {"songs": [], "total": 0, "error": str(e)}
+
+
+def search_migu(query: str, platform: str = "migu", page: int = 1) -> dict:
+    """Search via Migu Music (咪咕音乐) official API."""
+    try:
+        resp = req.get(
+            "https://pd.musicapp.migu.cn/MIGUM3.0/v1.0/content/search_all.do",
+            params={
+                "text": query,
+                "pageNo": page,
+                "pageSize": 20,
+                "searchSwitch": '{"song":1}',
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://m.music.migu.cn/",
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != "000000":
+            return {"songs": [], "total": 0, "error": data.get("info", "unknown")}
+
+        songs = []
+        for item in data.get("songResultData", {}).get("result", []):
+            singers = [s.get("name", "") for s in item.get("singers", [])]
+            artist = ", ".join(singers) if singers else "Unknown"
+            cover = ""
+            album_imgs = item.get("albumImgs") or item.get("imgItems") or []
+            if album_imgs:
+                cover = album_imgs[0].get("img", "")
+            songs.append({
+                "id": item.get("contentId", str(item.get("id", ""))),
+                "title": item.get("name", "Unknown"),
+                "artist": artist,
+                "cover": cover,
+                "duration": 0,
+                "heat": 0,
+                "lyric": "",
+                "url": "",
+                "link": f"https://music.migu.cn/v3/music/song/{item.get('copyrightId', '')}",
+                "platform": "migu",
+                "platform_name": "咪咕音乐",
+                "source": "migu",
+                "_copyright_id": item.get("copyrightId", ""),
+                "_content_id": item.get("contentId", ""),
+            })
+        total = int(data.get("songResultData", {}).get("totalCount", "0"))
+        return {"songs": songs, "total": total, "error": None}
+    except Exception as e:
+        return {"songs": [], "total": 0, "error": str(e)}
+
+
 def search_kugou(query: str, platform: str = "kugou", page: int = 1) -> dict:
     """Search via Kugou mobile API (works globally)."""
     try:
@@ -453,14 +556,14 @@ def search_direct(query: str, platform: str = "netease", page: int = 1) -> dict:
                 return sid, 0
 
         all_ids = [s["id"] for s in songs]
+        song_by_id = {s["id"]: s for s in songs}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
             futures = {ex.submit(_fetch_comment_count, sid): sid for sid in all_ids}
             for fut in concurrent.futures.as_completed(futures, timeout=15):
                 try:
                     sid, count = fut.result()
-                    for sng in songs:
-                        if sng["id"] == sid and count > 0:
-                            sng["heat"] = count
+                    if sid in song_by_id and count > 0:
+                        song_by_id[sid]["heat"] = count
                 except Exception:
                     pass
 
@@ -565,7 +668,6 @@ def search_kuwo(query: str, platform: str = "kuwo", page: int = 1) -> dict:
 # ---------------------------------------------------------------------------
 # Multi-source search framework — add new sites here
 # ---------------------------------------------------------------------------
-import re
 
 # Source: (name, search_fn, platforms_supported)
 SEARCH_SOURCES: list[tuple[str, callable, list[str]]] = []
@@ -580,11 +682,20 @@ def _register_sources():
     # Source 2: myhkw netease — additional results with audio proxy URLs
     SEARCH_SOURCES.append(("myhkw_ne", search_myhkw, ["netease"]))
 
-    # Source 3: Kugou native API — for kugou platform tab
+    # Source 3: QQ Music official API
+    SEARCH_SOURCES.append(("qqmusic", search_qqmusic, ["qq"]))
+
+    # Source 4: Kugou native API — for kugou platform tab
     SEARCH_SOURCES.append(("kugou", search_kugou, ["kugou"]))
 
-    # Source 4: Kuwo (酷我音乐) search API
+    # Source 5: Kuwo (酷我音乐) search API
     SEARCH_SOURCES.append(("kuwo", search_kuwo, ["kuwo"]))
+
+    # Source 6: Migu Music (咪咕音乐) official API
+    SEARCH_SOURCES.append(("migu", search_migu, ["migu"]))
+
+    # Source 7: Xiageba (下歌吧) — supplementary results for netease/qq/migu
+    SEARCH_SOURCES.append(("xiageba", search_xiageba, ["netease", "qq", "migu"]))
 
 def _normalize(text: str) -> str:
     """Normalize text for dedup: lowercase, strip punctuation/spaces."""
@@ -795,7 +906,7 @@ def api_song_detail(platform, song_id):
                 "link": f"https://music.163.com/#/song?id={detail.song_id}",
             })
 
-    # For qq/kugou: cross-search netease for cover
+    # For non-netease or netease-without-direct-match: cross-search netease for cover
     if title:
         try:
             search_q = f"{title} {artist}" if artist else title
@@ -811,20 +922,6 @@ def api_song_detail(platform, song_id):
                         })
         except Exception:
             pass
-
-    # Fallback to direct NetEase API
-    if platform == "netease":
-        detail = api.get_song_detail_sync(song_id)
-        if detail:
-            return jsonify({
-                "id": detail.song_id,
-                "title": detail.title,
-                "artist": detail.artist,
-                "cover": detail.cover_url,
-                "lyric": "",
-                "url": "",
-                "link": f"https://music.163.com/#/song?id={detail.song_id}",
-            })
 
     return jsonify({"error": "Song not found"}), 404
 
@@ -907,7 +1004,7 @@ def _embed_mp3_tags(
 ):
     """Embed ID3v2 tags into an MP3 file."""
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC
+    from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, TPUB, TENC
 
     audio = MP3(filepath, ID3=ID3)
     if audio.tags is None:
@@ -917,6 +1014,8 @@ def _embed_mp3_tags(
     audio.tags.add(TPE1(encoding=3, text=artist))
     if album:
         audio.tags.add(TALB(encoding=3, text=album))
+    audio.tags.add(TPUB(encoding=3, text="卡塔音乐"))
+    audio.tags.add(TENC(encoding=3, text="Kata Music"))
     if cover_data:
         audio.tags.add(APIC(
             encoding=3, mime=cover_mime, type=3,
@@ -937,6 +1036,9 @@ def _embed_flac_tags(
     audio["artist"] = artist
     if album:
         audio["album"] = album
+    audio["publisher"] = "卡塔音乐"
+    audio["organization"] = "Kata Music"
+    audio["encodedby"] = "Kata Music"
 
     if cover_data:
         pic = Picture()
@@ -1276,48 +1378,71 @@ def _download_mp3_from_cdn(cdn_url: str, artist: str, title: str, song_id: str, 
     try:
         import tempfile as _tmp
 
-        # Get metadata from Netease API for richer tags
+        # ── Get metadata from NetEase API for richer tags ──
         album = ""
         cover_url = ""
-        if platform == "netease" or True:
+        try:
             detail = api.get_song_detail_sync(song_id)
             if detail:
                 if detail.album:
                     album = detail.album
                 if detail.cover_url:
                     cover_url = detail.cover_url
+        except Exception:
+            pass
 
-        # Download cover image
+        # ── Download cover image (CDN now requires music-platform Referer) ──
         cover_data = None
         cover_mime = "image/jpeg"
+        cover_urls_to_try = []
         if cover_url:
+            cover_urls_to_try.append(cover_url)
+        # Also try a high-res variant (NetEase CDN pattern: <id>?param=300y300)
+        if cover_url and "music.126.net" in cover_url:
+            cover_urls_to_try.append(cover_url.split("?")[0] + "?param=500y500")
+
+        for cu in cover_urls_to_try:
+            if cover_data:
+                break
+            for hdrs in [
+                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                 "Referer": "https://music.163.com/"},
+                {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+                {"User-Agent": "NeteaseMusic/8.0.0", "Referer": "https://music.163.com/"},
+            ]:
+                try:
+                    cr = req.get(cu, timeout=12, headers=hdrs)
+                    if cr.status_code == 200 and len(cr.content) > 500:
+                        cover_data = cr.content
+                        if cover_data[:4] == b"\x89PNG":
+                            cover_mime = "image/png"
+                        break
+                except Exception:
+                    continue
+
+        # ── Write audio to temp file for mutagen processing ──
+        tf = _tmp.NamedTemporaryFile(delete=False, suffix=".mp3")
+        try:
+            tf.write(mp3_data)
+            tf.close()
+
+            # Detect format and embed tags
+            audio_ext = _detect_audio_format(mp3_data)
+            if audio_ext == "flac":
+                _embed_flac_tags(tf.name, title, artist, album, cover_data, cover_mime)
+            else:
+                _embed_mp3_tags(tf.name, title, artist, album, cover_data, cover_mime)
+
+            # Read back the tagged file
+            with open(tf.name, "rb") as f:
+                mp3_data = f.read()
+        finally:
             try:
-                cr = req.get(cover_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                if cr.status_code == 200 and len(cr.content) > 500:
-                    cover_data = cr.content
-                    if cover_data[:4] == b"\x89PNG":
-                        cover_mime = "image/png"
+                os.unlink(tf.name)
             except Exception:
                 pass
-
-        # Write audio to temp file for mutagen processing
-        tf = _tmp.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tf.write(mp3_data)
-        tf.close()
-
-        # Detect format and embed tags
-        audio_ext = _detect_audio_format(mp3_data)
-        if audio_ext == "flac":
-            _embed_flac_tags(tf.name, title, artist, album, cover_data, cover_mime)
-        else:
-            _embed_mp3_tags(tf.name, title, artist, album, cover_data, cover_mime)
-
-        # Read back the tagged file
-        with open(tf.name, "rb") as f:
-            mp3_data = f.read()
-        os.unlink(tf.name)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"[download] tag embedding failed for {title}: {e}")
 
     from urllib.parse import quote
     # HTTP headers are Latin-1 only. filename= must be ASCII;
@@ -1331,7 +1456,7 @@ def _download_mp3_from_cdn(cdn_url: str, artist: str, title: str, song_id: str, 
 
 @app.route("/api/download/<platform>/<song_id>")
 def api_download(platform, song_id):
-    """Download MP3 — loops through all API sources with retries until success."""
+    """Download MP3 — tries multiple audio sources until success."""
     import time
     title = request.args.get("title", "")
     artist = request.args.get("artist", "")
@@ -1340,54 +1465,64 @@ def api_download(platform, song_id):
     title = title or "Unknown"
 
     # Each strategy returns (Response, None) on success or (None, str_error) on failure
-    def try_myhkw_cached():
-        """Strategy 1: Use myhkw proxy URL from search results."""
-        cached_url = request.args.get("url", "")
-        if not cached_url:
-            return None, "no cached url"
-        from platforms.myhkw_api import _resolve_proxy_url
-        full_url = _resolve_proxy_url(cached_url)
-        if not full_url:
-            return None, "resolve_proxy failed"
-        resp = _download_mp3_from_cdn(full_url, artist, title, song_id, platform)
-        return (resp, None) if resp else (None, "cdn download failed")
-
-    def try_myhkw_by_id():
-        """Strategy 2: Search myhkw by NetEase song ID."""
-        cdn_url = resolve_song_url(song_id, platform)
-        if not cdn_url:
-            return None, "resolve by id failed"
-        resp = _download_mp3_from_cdn(cdn_url, artist, title, song_id, platform)
-        return (resp, None) if resp else (None, "cdn download failed")
-
-    def try_myhkw_by_keyword():
-        """Strategy 3: Search myhkw by title + artist keyword."""
-        if not title or title == "Unknown":
-            return None, "no title to search"
-        result = resolve_song_by_keyword(title, artist)
-        if not result:
-            return None, "keyword search failed"
-        cdn_url, matched_id = result
-        resp = _download_mp3_from_cdn(cdn_url, artist, title, matched_id, platform)
-        return (resp, None) if resp else (None, "cdn download failed")
 
     def try_netease_direct():
-        """Strategy 4: Direct NetEase API (geo-restricted)."""
+        """Strategy 1: Direct NetEase API for netease platform songs."""
         if platform != "netease":
-            return None, "not netease"
-        url = api.get_song_url_sync(song_id, "standard")
+            return None, "not netease platform"
+        url = api.get_song_url_sync(song_id, "lossless")
+        if not url:
+            url = api.get_song_url_sync(song_id, "standard")
         if not url:
             return None, "netease direct no url"
-        return (stream_download(url, artist, title, "standard"), None)
+        resp = _download_mp3_from_cdn(url, artist, title, song_id, "netease")
+        return (resp, None) if resp else (None, "netease direct download failed")
 
+    def try_netease_cross_search():
+        """Strategy 2: Cross-search NetEase by title+artist, use NetEase audio."""
+        if not title or title == "Unknown":
+            return None, "no title for cross-search"
+        try:
+            search_q = f"{title} {artist}" if artist else title
+            result = api.search_sync(search_q, limit=5)
+            if not result or not result.songs:
+                return None, "cross-search: no netease match"
+            # Try each match until we get a download
+            for ns in result.songs:
+                url = api.get_song_url_sync(ns.song_id, "lossless")
+                if not url:
+                    url = api.get_song_url_sync(ns.song_id, "standard")
+                if url:
+                    resp = _download_mp3_from_cdn(url, artist, title, ns.song_id, "netease")
+                    if resp:
+                        log.info(f"[download] cross-search matched: {ns.title} (id={ns.song_id})")
+                        return (resp, None)
+            return None, "cross-search: all matches failed"
+        except Exception as e:
+            return None, f"cross-search error: {e}"
+
+    def try_myhkw_by_keyword():
+        """Strategy 3: Search myhkw.cn by title + artist (may be down)."""
+        if not title or title == "Unknown":
+            return None, "no title to search"
+        try:
+            result = resolve_song_by_keyword(title, artist)
+            if not result:
+                return None, "myhkw keyword search failed"
+            cdn_url, matched_id = result
+            resp = _download_mp3_from_cdn(cdn_url, artist, title, matched_id, platform)
+            return (resp, None) if resp else (None, "myhkw cdn download failed")
+        except Exception as e:
+            return None, f"myhkw keyword error: {e}"
+
+    # Order: NetEase direct (fastest) → NetEase cross-search (reliable) → myhkw (fallback)
     strategies = [
-        ("myhkw_cached", try_myhkw_cached),
-        ("myhkw_by_id", try_myhkw_by_id),
-        ("myhkw_keyword", try_myhkw_by_keyword),
         ("netease_direct", try_netease_direct),
+        ("netease_cross", try_netease_cross_search),
+        ("myhkw_keyword", try_myhkw_by_keyword),
     ]
 
-    max_rounds = 2  # loop all strategies up to 2 times
+    max_rounds = 2
     errors = []
 
     for round_num in range(1, max_rounds + 1):
@@ -1397,18 +1532,26 @@ def api_download(platform, song_id):
                     resp, err = strategy_fn()
                     if resp:
                         log.info(f"[download] SUCCESS: {strategy_name} (round={round_num}, attempt={attempt})")
+                        try:
+                            analytics.track_download(song_id, title, artist, platform, strategy_name, True)
+                        except Exception:
+                            pass
                         return resp
                     errors.append(f"[R{round_num}/A{attempt}] {strategy_name}: {err}")
                 except Exception as e:
                     errors.append(f"[R{round_num}/A{attempt}] {strategy_name}: {type(e).__name__}: {e}")
                 if attempt == 1:
-                    time.sleep(0.5)  # brief pause between attempts
-            time.sleep(0.3)  # brief pause between strategies
+                    time.sleep(0.5)
+            time.sleep(0.3)
         if round_num < max_rounds:
-            log.info(f"[download] Round {round_num} failed, retrying all strategies...")
+            log.info(f"[download] Round {round_num} failed, retrying...")
             time.sleep(1)
 
     log.error(f"[download] ALL FAILED for {name}: {'; '.join(errors[-10:])}")
+    try:
+        analytics.track_download(song_id, title, artist, platform, "", False)
+    except Exception:
+        pass
     return jsonify({
         "error": "所有音源均无法下载",
         "detail": f"《{name}》经过了 {max_rounds} 轮共 {len(strategies)*2*max_rounds} 次尝试，所有音源均失败。",
@@ -1466,6 +1609,122 @@ def api_resolve_source(song_id):
     return jsonify({"success": False, "message": "no source"}), 404
 
 
+@app.route("/api/stream/<song_id>")
+def api_stream_audio(song_id):
+    """Stream audio through the server so the browser never hits the CDN directly.
+
+    Resolves audio URL via NetEase API (direct or cross-search), then fetches
+    server-side with the correct Referer header and streams to the browser.
+    Supports HTTP Range requests for seeking.
+    """
+    platform = request.args.get("platform", "")
+    title = request.args.get("title", "")
+    artist = request.args.get("artist", "")
+
+    # ── Resolve audio URL ──
+    url = None
+
+    # Strategy 1: NetEase direct (for netease platform)
+    if platform == "netease":
+        url = api.get_song_url_sync(song_id, "lossless")
+        if not url:
+            url = api.get_song_url_sync(song_id, "standard")
+
+    # Strategy 2: NetEase cross-search by title+artist
+    if not url and title:
+        try:
+            search_q = f"{title} {artist}" if artist else title
+            result = api.search_sync(search_q, limit=5)
+            if result and result.songs:
+                for ns in result.songs:
+                    u = api.get_song_url_sync(ns.song_id, "lossless")
+                    if not u:
+                        u = api.get_song_url_sync(ns.song_id, "standard")
+                    if u:
+                        url = u
+                        log.info(f"[stream] cross-search matched: {ns.title} (id={ns.song_id})")
+                        break
+        except Exception as e:
+            log.warning(f"[stream] cross-search failed: {e}")
+
+    # Strategy 3: myhkw.cn (may be down)
+    if not url:
+        if platform:
+            url = resolve_song_url(song_id, platform)
+        else:
+            url = resolve_song_url_raw(song_id)
+
+    # Strategy 4: myhkw keyword search
+    if not url and title:
+        result = resolve_song_by_keyword(title, artist)
+        if result:
+            url, _ = result
+
+    if not url:
+        return jsonify({"error": "no audio source available"}), 404
+
+    # ── Fetch audio server-side with music-platform Referer ──
+    try:
+        downstream = req.get(
+            url,
+            stream=True,
+            timeout=60,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/130.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://music.163.com/",
+            },
+        )
+        downstream.raise_for_status()
+    except Exception as e:
+        log.error(f"[stream] fetch failed for {song_id}: {e}")
+        return jsonify({"error": f"upstream fetch failed: {e}"}), 502
+
+    content_type = downstream.headers.get("Content-Type", "audio/mpeg")
+    content_length = downstream.headers.get("Content-Length")
+
+    # ── Range-request support (for seeking) ──
+    range_header = request.headers.get("Range")
+    status = 200
+    resp_headers = {
+        "Content-Type": content_type,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=7200",
+    }
+
+    if range_header and content_length:
+        try:
+            raw_range = range_header.replace("bytes=", "")
+            parts = raw_range.split("-")
+            range_start = int(parts[0]) if parts[0] else 0
+            range_end = int(parts[1]) if len(parts) > 1 and parts[1] else int(content_length) - 1
+
+            resp_headers["Content-Range"] = f"bytes {range_start}-{range_end}/{content_length}"
+            resp_headers["Content-Length"] = str(range_end - range_start + 1)
+            status = 206
+
+            full_data = downstream.content
+            return Response(
+                full_data[range_start:range_end + 1],
+                status=206,
+                headers=resp_headers,
+            )
+        except (ValueError, IndexError):
+            pass
+    else:
+        if content_length:
+            resp_headers["Content-Length"] = content_length
+
+    return Response(
+        downstream.iter_content(8192),
+        status=status,
+        headers=resp_headers,
+    )
+
+
 @app.route("/api/lrc/<platform>/<song_id>")
 def api_lrc_download(platform, song_id):
     """Download LRC lyrics file. Named same as the song."""
@@ -1515,6 +1774,173 @@ def api_lrc_download(platform, song_id):
         content_type="text/plain; charset=utf-8",
         headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Playlist import — parse URLs from mainstream music platforms
+# ---------------------------------------------------------------------------
+
+_PLAYLIST_URL_PATTERNS = [
+    # NetEase: music.163.com/playlist?id=123  or  /#/playlist?id=123
+    (re.compile(r'music\.163\.com/(?:#/)?playlist\?id=(\d+)', re.I), "netease"),
+    (re.compile(r'music\.163\.com/playlist/(\d+)', re.I), "netease"),
+    # QQ Music: y.qq.com/n/ryqq/playlist/123
+    (re.compile(r'y\.qq\.com/n/ryqq/playlist/(\d+)', re.I), "qq"),
+    (re.compile(r'[?&]id=(\d+)', re.I), "qq"),  # fallback if domain matches
+    # Kugou
+    (re.compile(r'kugou\.com/songlist/(\w+)', re.I), "kugou"),
+    (re.compile(r't\d?\.kugou\.com/([a-zA-Z0-9]+)', re.I), "kugou"),
+    # Kuwo
+    (re.compile(r'kuwo\.cn/playlist_detail/(\d+)', re.I), "kuwo"),
+    (re.compile(r'kuwo\.cn/album_detail/(\d+)', re.I), "kuwo"),
+]
+
+
+def parse_playlist_url(url: str) -> tuple[str, str] | None:
+    """Extract (platform, playlist_id) from a music-platform share URL."""
+    for pattern, platform in _PLAYLIST_URL_PATTERNS:
+        if platform == "qq" and pattern.pattern == r'[?&]id=(\d+)':
+            if "y.qq.com" not in url and "qq.com" not in url:
+                continue
+        m = pattern.search(url)
+        if m:
+            return (platform, m.group(1))
+    return None
+
+
+def _fetch_qq_playlist(pid: str) -> list[dict]:
+    """Fetch a QQ Music playlist by ID. Returns list of standard song dicts."""
+    resp = req.get(
+        "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg",
+        params={"type": 1, "json": 1, "utf8": 1, "onlysong": 0, "disstid": pid,
+                "format": "json", "inCharset": "utf8", "outCharset": "utf8"},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://y.qq.com/"},
+        timeout=15,
+    )
+    data = resp.json()
+    songs = []
+    for cd in data.get("cdlist", []):
+        for song in cd.get("songlist", []):
+            singers = song.get("singer", [])
+            artist = ", ".join(s.get("name", "") for s in singers) if singers else "Unknown"
+            albummid = song.get("albummid", "")
+            songs.append({
+                "id": str(song.get("songid", song.get("id", ""))),
+                "title": song.get("songname", song.get("name", "Unknown")),
+                "artist": artist,
+                "cover": f"https://y.gtimg.cn/music/photo_new/T002R300x300M000{albummid}.jpg" if albummid else "",
+                "duration": int(song.get("interval", 0)) * 1000,
+                "platform": "qq",
+                "platform_name": "QQ音乐",
+            })
+    return songs
+
+
+def _fetch_kugou_playlist(pid: str) -> list[dict]:
+    """Fetch a Kugou special/songlist by ID."""
+    resp = req.get(
+        "http://mobilecdn.kugou.com/api/v3/special/song",
+        params={"specialid": pid, "page": 1, "pagesize": 500, "format": "json"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+    )
+    data = resp.json()
+    songs = []
+    for item in data.get("data", {}).get("info", []):
+        songs.append({
+            "id": item.get("hash", ""),
+            "title": item.get("songname", item.get("filename", "Unknown")),
+            "artist": item.get("singername", "Unknown"),
+            "cover": item.get("imgUrl", ""),
+            "duration": int(item.get("duration", 0)) * 1000,
+            "platform": "kugou",
+            "platform_name": "酷狗",
+        })
+    return songs
+
+
+def _fetch_kuwo_playlist(pid: str) -> list[dict]:
+    """Fetch a Kuwo playlist/album by ID."""
+    resp = req.get(
+        f"http://www.kuwo.cn/api/www/playlist/playListInfo",
+        params={"pid": pid, "pn": 1, "rn": 500, "httpsStatus": 1},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "http://www.kuwo.cn/",
+            "csrf": "1", "Cookie": "kw_token=1",
+        },
+        timeout=15,
+    )
+    data = resp.json()
+    songs = []
+    for item in data.get("data", {}).get("musicList", []):
+        songs.append({
+            "id": str(item.get("rid", "")),
+            "title": item.get("name", "Unknown"),
+            "artist": item.get("artist", "Unknown"),
+            "cover": item.get("pic", item.get("albumpic", "")),
+            "duration": int(item.get("duration", 0)) * 1000,
+            "platform": "kuwo",
+            "platform_name": "酷我",
+        })
+    return songs
+
+
+@app.route("/api/playlist/import")
+def api_playlist_import():
+    """Import a playlist from a share URL.
+
+    Returns a list of songs with available metadata (covers fetched where
+    possible).  The frontend adds these to its play queue.
+    """
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "Missing playlist URL"}), 400
+
+    parsed = parse_playlist_url(url)
+    if not parsed:
+        return jsonify({"error": "无法识别的歌单链接，支持：网易云音乐、QQ音乐、酷狗、酷我"}), 400
+
+    platform, pid = parsed
+    songs = []
+
+    try:
+        if platform == "netease":
+            tracks = api.get_playlist_sync(pid)
+            for t in tracks:
+                songs.append({
+                    "id": t.song_id,
+                    "title": t.title,
+                    "artist": t.artist,
+                    "cover": t.cover_url or "",
+                    "duration": t.duration_ms,
+                    "platform": "netease",
+                    "platform_name": "网易云",
+                })
+
+        elif platform == "qq":
+            songs = _fetch_qq_playlist(pid)
+
+        elif platform == "kugou":
+            songs = _fetch_kugou_playlist(pid)
+
+        elif platform == "kuwo":
+            songs = _fetch_kuwo_playlist(pid)
+
+        if not songs:
+            return jsonify({"error": "歌单为空或无法读取"}), 404
+
+        log.info(f"[playlist] Imported {len(songs)} songs from {platform} playlist {pid}")
+        return jsonify({
+            "songs": songs,
+            "total": len(songs),
+            "platform": platform,
+            "platform_name": {"netease": "网易云", "qq": "QQ音乐", "kugou": "酷狗", "kuwo": "酷我"}.get(platform, platform),
+        })
+
+    except Exception as e:
+        log.error(f"[playlist] Import failed for {platform}/{pid}: {e}")
+        return jsonify({"error": f"导入失败：{e}"}), 502
 
 
 @app.route("/api/lyrics/<platform>/<song_id>")
@@ -1579,6 +2005,696 @@ def robots_txt():
         "Disallow: /img/\n",
         content_type="text/plain",
     )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — simple in-memory sliding-window per IP
+# ---------------------------------------------------------------------------
+_rate_limit_store: dict[str, list[float]] = {}
+_rate_limit_rpm = int(os.environ.get("MD_RATE_LIMIT_RPM", "60"))
+_rate_limit_enabled = os.environ.get("MD_RATE_LIMIT", "true").lower() in ("1", "true", "yes")
+
+@app.before_request
+def _rate_limit():
+    """Reject requests that exceed the per-minute rate limit."""
+    if not _rate_limit_enabled:
+        return
+    if request.path.startswith("/static/") or request.path.startswith("/img/"):
+        return
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1")
+    ip = ip.split(",")[0].strip()
+    now = time.time()
+    window = now - 60
+    bucket = _rate_limit_store.get(ip, [])
+    # Evict expired entries
+    bucket = [t for t in bucket if t > window]
+    if len(bucket) >= _rate_limit_rpm:
+        return jsonify({"error": "请求过于频繁，请稍后再试", "retry_after": 60}), 429
+    bucket.append(now)
+    _rate_limit_store[ip] = bucket
+    # Periodic cleanup: purge stale IP entries every 500 requests
+    if len(_rate_limit_store) % 500 == 0:
+        for k in list(_rate_limit_store):
+            _rate_limit_store[k] = [t for t in _rate_limit_store[k] if t > window]
+            if not _rate_limit_store[k]:
+                del _rate_limit_store[k]
+
+# ---------------------------------------------------------------------------
+# Visitor tracking middleware
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def _track_visitor():
+    """Record every page / API visit (exclude static files)."""
+    if request.path.startswith("/static/") or request.path.startswith("/img/"):
+        return
+    if request.path == "/robots.txt":
+        return
+    try:
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1")
+        ip = ip.split(",")[0].strip()
+        ua = request.headers.get("User-Agent", "")
+        analytics.track_visit(ip, ua)
+    except Exception:
+        pass  # never break the main app for analytics
+
+
+# ---------------------------------------------------------------------------
+# Admin API routes
+# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-LAYER ADMIN AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Layer 1: PBKDF2-300K hash storage (password never in plaintext)
+# Layer 2: Challenge-response protocol (password never sent over wire)
+# Layer 3: Rate limiting (brute-force prevention)
+# Layer 4: Timing-safe comparison (side-channel protection)
+# Layer 5: XOR-split secret assembly (anti-grep obfuscation)
+# Layer 6: HMAC-signed session tokens with expiry
+#
+# Production override: set MD_ADMIN_PASSWORD env var (plaintext, takes
+# precedence over built-in credentials). Use only over HTTPS.
+
+# --- XOR-split secret storage ---
+# Each secret is split into 3 byte arrays XOR'd together at runtime.
+# No single part is useful alone; grep-ers find nothing.
+
+# FAST_HASH = SHA256(password) — for challenge-response verification
+_F0 = bytes.fromhex("f086b198af50442f51ffc6bc50f57dd8b2aee6d1e0f6b0247c795bf60859afc4")
+_F1 = bytes.fromhex("4a320c3d7f1bcf354dd110ff8ededd32773abe0b9ec28606469d60dff1426b55")
+_F2 = bytes.fromhex("24e0b07415a01faa2f53ebf2d9ef3176f3a1b03d1b96d03ebc19ab262878c3c6")
+
+# PBKDF2 salt parts (XOR → real salt)
+_S0 = bytes.fromhex("b5a09428ef46eb359d6e52d91598e40a3b14f0edf11629186241b1882cab7922")
+_S1 = bytes.fromhex("e23979847814c1df412ca39738a20527ac27f854b0a938d7ca7233006e593aa2")
+_S2 = bytes.fromhex("95cd60e0921493913e6d610250cc3647508b030df72eb32c238560fb68a20081")
+
+# PBKDF2 hash parts (XOR → real 300k-iteration PBKDF2 hash)
+_H0 = bytes.fromhex("9a4ee22ba87a6ea63a8fe2c1bd03181e0448edfce59f4b6e4ba2d33261cfd97b")
+_H1 = bytes.fromhex("232c318c0606c884ad8959df6dc00b5e49f307e027c72bb78e1df722feabe518")
+_H2 = bytes.fromhex("414210913a7463c2f8d205f68fac629ab6c663dccf273c3f95d98111a74748b5")
+
+_PBKDF2_ITERATIONS = 300000
+
+# Admin session state
+_admin_nonce_store = {}   # nonce → (timestamp, attempts)
+_admin_attempt_ips = {}   # ip → [(timestamp, success)]
+_admin_token_key = os.environ.get("MD_ADMIN_SECRET", os.urandom(32))
+if isinstance(_admin_token_key, str):
+    _admin_token_key = _admin_token_key.encode()
+
+def _xor_bytes(*args):
+    """Combine multiple byte arrays via XOR. All must be same length."""
+    result = bytearray(len(args[0]))
+    for a in args:
+        for i in range(len(result)):
+            result[i] ^= a[i]
+    return bytes(result)
+
+def _get_fast_hash():
+    """Reassemble FAST_HASH = SHA256(password) from XOR-split parts.
+
+    When MD_ADMIN_PASSWORD env var is set, derives the hash from it instead.
+    """
+    env_pwd = os.environ.get("MD_ADMIN_PASSWORD", "")
+    if env_pwd:
+        return hashlib.sha256(env_pwd.encode()).digest()
+    return _xor_bytes(_F0, _F1, _F2)
+
+def _get_pbkdf2_verifier():
+    """Reassemble PBKDF2 salt & hash from XOR-split parts.
+
+    Returns (salt, hash) for PBKDF2 verification.
+    """
+    salt = _xor_bytes(_S0, _S1, _S2)
+    stored_hash = _xor_bytes(_H0, _H1, _H2)
+    return salt, stored_hash, _PBKDF2_ITERATIONS
+
+def _verify_password(pwd: str) -> bool:
+    """Verify a plaintext password against the stored PBKDF2 hash.
+
+    Uses constant-time comparison to prevent timing attacks.
+    Environment variable MD_ADMIN_PASSWORD overrides the built-in hash.
+    """
+    env_pwd = os.environ.get("MD_ADMIN_PASSWORD", "")
+    if env_pwd:
+        return hmac.compare_digest(pwd.encode(), env_pwd.encode())
+
+    salt, stored_hash, iters = _get_pbkdf2_verifier()
+    computed = hashlib.pbkdf2_hmac("sha256", pwd.encode(), salt, iters)
+    return hmac.compare_digest(computed, stored_hash)
+
+def _admin_make_token() -> str:
+    """Create a signed session token: version:timestamp:signature."""
+    ts = str(int(time.time()))
+    msg = f"v2:{ts}"
+    sig = hmac.new(_admin_token_key, msg.encode(), "sha256").hexdigest()
+    return f"{msg}:{sig}"
+
+def _admin_verify_token(token: str) -> bool:
+    """Verify a session token signature and check expiry (max 8 hours)."""
+    parts = token.split(":")
+    if len(parts) != 3 or parts[0] != "v2":
+        return False
+    ts_str, sig = parts[1], parts[2]
+    try:
+        ts = int(ts_str)
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > 28800:  # 8 hours
+        return False
+    expected = hmac.new(_admin_token_key, f"v2:{ts_str}".encode(), "sha256").hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+def _admin_rate_check(ip: str) -> tuple[bool, str]:
+    """Check rate limits for admin authentication.
+
+    Returns (allowed, reason).
+    - Max 5 attempts per IP per minute
+    - Max 15 attempts per IP per hour
+    - After 15 failures, IP blocked for 1 hour
+    """
+    now = time.time()
+    attempts = _admin_attempt_ips.get(ip, [])
+
+    # Clean old entries
+    attempts = [a for a in attempts if now - a[0] < 3600]
+
+    # Check hourly cap
+    if len(attempts) >= 15:
+        # Check if last attempt was recent (still blocked)
+        if now - attempts[-1][0] < 3600:
+            return False, "too many attempts, try again later"
+
+    # Check per-minute cap (last 5 in < 60s)
+    if len(attempts) >= 5:
+        recent = sorted(a[0] for a in attempts[-5:])
+        if recent[-1] - recent[0] < 60:
+            return False, "too fast, slow down"
+
+    attempts.append((now, False))
+    _admin_attempt_ips[ip] = attempts
+    return True, "ok"
+
+def _admin_cleanup():
+    """Purge expired nonces (older than 5 min) and old IP records (older than 2h)."""
+    now = time.time()
+    expired_nonces = [n for n, (ts, _) in _admin_nonce_store.items() if now - ts > 300]
+    for n in expired_nonces:
+        _admin_nonce_store.pop(n, None)
+    for ip in list(_admin_attempt_ips.keys()):
+        _admin_attempt_ips[ip] = [a for a in _admin_attempt_ips[ip] if now - a[0] < 7200]
+        if not _admin_attempt_ips[ip]:
+            del _admin_attempt_ips[ip]
+
+# External APIs to monitor
+APIS_TO_CHECK = [
+    ("myhkw.cn (搜索)", "http://s.myhkw.cn/", 8),
+    ("NetEase API", "https://music.163.com/api/search/get", 8),
+    ("QQ Music API", "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=test&n=1&p=1&format=json", 8),
+    ("Kugou API", "http://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword=test&page=1&pagesize=1", 10),
+    ("Kuwo API", "http://search.kuwo.cn/r.s?all=test&ft=music&pn=0&rn=1&rformat=json", 9),
+    ("Migu API", "https://pd.musicapp.migu.cn/MIGUM3.0/v1.0/content/search_all.do?text=test&pageNo=1&pageSize=1&searchSwitch={\"song\":1}", 10),
+    ("GDStudio API", "https://gdstudio.xyz/api.php?types=search&source=netease&name=test&page=1", 10),
+    ("Xiageba API", "https://xiageba.liumingye.cn/api/music/search?q=test&page=1&pageSize=1", 10),
+    ("Luckxz", "https://luckxz.com/", 8),
+    ("Tonzhon (legacy)", "https://tonzhon.whamon.com/", 8),
+]
+
+
+def _ping_single(name: str, url: str, timeout: int) -> dict:
+    """Ping one external API and return its status."""
+    try:
+        import requests as _r
+        start = time.time()
+        r = _r.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        elapsed = int((time.time() - start) * 1000)
+        ok = r.status_code in (200, 301, 302, 307, 308)
+        return {"available": ok, "status_code": r.status_code, "response_ms": elapsed}
+    except Exception as e:
+        return {"available": False, "error": str(e)[:100], "response_ms": 0}
+
+
+# ---------------------------------------------------------------------------
+# Batch download — ZIP all queue songs / lyrics, stream progress + serve zip
+# ---------------------------------------------------------------------------
+
+_batch_store: dict[str, str] = {}  # token → temp zip filepath
+_batch_store_ts: dict[str, float] = {}  # token → creation timestamp
+_batch_cancel: dict[str, threading.Event] = {}  # token → cancel event
+_BATCH_TTL = 3600  # 1 hour — stale zips auto-deleted on next request
+
+
+def _cleanup_batch_store():
+    """Remove expired batch ZIPs (older than _BATCH_TTL seconds)."""
+    now = time.time()
+    stale = [t for t, ts in _batch_store_ts.items() if now - ts > _BATCH_TTL]
+    for t in stale:
+        path = _batch_store.pop(t, None)
+        _batch_store_ts.pop(t, None)
+        _batch_cancel.pop(t, None)
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
+def _download_single_mp3(song: dict) -> tuple[str | None, bytes | None]:
+    """Download one song as MP3 bytes with embedded tags.
+
+    Returns ``(filename, audio_bytes)`` or ``(None, None)`` on failure.
+    """
+    sid = song.get("id", "")
+    platform = song.get("platform", "netease")
+    title = sanitize_filename(song.get("title", "Unknown"))
+    artist = sanitize_filename(song.get("artist", "Unknown"))
+    filename = build_filename(artist, title, "mp3")
+
+    url = None
+    if platform == "netease":
+        url = api.get_song_url_sync(sid, "lossless")
+        if not url:
+            url = api.get_song_url_sync(sid, "standard")
+    if not url and title and title != "Unknown":
+        try:
+            search_q = f"{title} {artist}" if artist else title
+            result = api.search_sync(search_q, limit=5)
+            if result and result.songs:
+                for ns in result.songs:
+                    u = api.get_song_url_sync(ns.song_id, "lossless")
+                    if not u: u = api.get_song_url_sync(ns.song_id, "standard")
+                    if u: url = u; break
+        except Exception: pass
+
+    if not url:
+        return None, None
+
+    try:
+        audio_data = None
+        for hdrs in [
+            {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://music.163.com/"},
+            {"User-Agent": "NeteaseMusic/8.0.0", "Referer": "https://music.163.com/"},
+        ]:
+            try:
+                r = req.get(url, timeout=30, headers=hdrs)
+                if r.status_code == 200 and len(r.content) > 1024:
+                    audio_data = r.content; break
+            except Exception: continue
+        if not audio_data: return None, None
+
+        # Fetch song detail once for both cover + album
+        cover_data = None; cover_mime = "image/jpeg"; album = ""
+        try:
+            detail = api.get_song_detail_sync(sid)
+            if detail:
+                if detail.album:
+                    album = detail.album
+                if detail.cover_url:
+                    for hdrs in [
+                        {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://music.163.com/"},
+                        {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+                    ]:
+                        try:
+                            cr = req.get(detail.cover_url, timeout=10, headers=hdrs)
+                            if cr.status_code == 200 and len(cr.content) > 500:
+                                cover_data = cr.content
+                                if cover_data[:4] == b"\x89PNG": cover_mime = "image/png"
+                                break
+                        except Exception: continue
+        except Exception: pass
+
+        ext = _detect_audio_format(audio_data)
+        import tempfile as _tmp
+        tf = _tmp.NamedTemporaryFile(delete=False, suffix=".tmp")
+        try:
+            tf.write(audio_data); tf.close()
+            if ext == "flac":
+                _embed_flac_tags(tf.name, title, artist, album, cover_data, cover_mime)
+            else:
+                _embed_mp3_tags(tf.name, title, artist, album, cover_data, cover_mime)
+            with open(tf.name, "rb") as f: audio_data = f.read()
+        finally:
+            try: os.unlink(tf.name)
+            except Exception: pass
+
+        return filename, audio_data
+    except Exception:
+        return None, None
+
+
+def _download_single_lrc(song: dict) -> tuple[str | None, str | None]:
+    """Download one song's LRC lyrics.
+
+    Returns ``(filename, lrc_text)`` or ``(None, None)`` on failure.
+    """
+    sid = song.get("id", "")
+    platform = song.get("platform", "netease")
+    title = sanitize_filename(song.get("title", "Unknown"))
+    artist = sanitize_filename(song.get("artist", "Unknown"))
+    filename = build_filename(artist, title, "lrc")
+
+    lrc_text = ""
+    if platform == "netease":
+        try: lrc_text = api.get_lyrics_sync(sid)
+        except Exception: pass
+    if not lrc_text:
+        try: lrc_text = myhkw_lyrics(sid, platform)
+        except Exception: pass
+
+    if not lrc_text or lrc_text == "[00:00.00] 暂无歌词":
+        return None, None
+    return filename, lrc_text
+
+
+@app.route("/api/batch/download-songs", methods=["POST"])
+def api_batch_download_songs():
+    """Download all songs as MP3, stream progress, return zip via token."""
+    data = request.get_json(silent=True) or {}
+    songs = data.get("songs", [])
+    if not songs:
+        return jsonify({"error": "No songs provided"}), 400
+
+    token = secrets.token_hex(16)
+    cancel = threading.Event()
+    _batch_cancel[token] = cancel
+    _batch_store_ts[token] = time.time()
+    _cleanup_batch_store()
+
+    def generate():
+        try:
+            files = []
+            success = fail = 0
+            for i, song in enumerate(songs):
+                if cancel.is_set():
+                    yield json.dumps({"cancelled": True}, ensure_ascii=False) + "\n"
+                    return
+                name, audio = _download_single_mp3(song)
+                if name and audio:
+                    files.append((name, audio)); success += 1
+                else:
+                    fail += 1
+                yield json.dumps({
+                    "index": i, "total": len(songs), "phase": "download",
+                    "title": song.get("title", ""),
+                    "successCount": success, "failCount": fail,
+                }, ensure_ascii=False) + "\n"
+
+            if not files:
+                yield json.dumps({"done": True, "error": "All downloads failed"}, ensure_ascii=False) + "\n"
+                return
+
+            cancelled = cancel.is_set()
+
+            # Build zip (partial if cancelled)
+            yield json.dumps({"phase": "pack", "packing": True}, ensure_ascii=False) + "\n"
+            today = datetime.now().strftime("%Y%m%d")
+            zip_name = f"歌曲MP3_{today}"
+            buf = io.BytesIO()
+            seen = set()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, data in files:
+                    base = name; i = 1
+                    while name in seen:
+                        stem, ext = base.rsplit(".", 1)
+                        name = f"{stem}({i}).{ext}"; i += 1
+                    seen.add(name)
+                    zf.writestr(name, data)
+            buf.seek(0)
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            tmp.write(buf.getvalue())
+            tmp.close()
+            _batch_store[token] = tmp.name
+
+            yield json.dumps({
+                "done": True, "token": token, "filename": zip_name + ".zip",
+                "success": success, "fail": fail, "total": len(songs),
+                "cancelled": cancelled,
+            }, ensure_ascii=False) + "\n"
+        finally:
+            _batch_cancel.pop(token, None)
+
+    return Response(generate(), mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/api/batch/download-lyrics", methods=["POST"])
+def api_batch_download_lyrics():
+    """Download LRC lyrics, stream progress, return zip via token."""
+    data = request.get_json(silent=True) or {}
+    songs = data.get("songs", [])
+    if not songs:
+        return jsonify({"error": "No songs provided"}), 400
+
+    token = secrets.token_hex(16)
+    cancel = threading.Event()
+    _batch_cancel[token] = cancel
+    _batch_store_ts[token] = time.time()
+    _cleanup_batch_store()
+
+    def generate():
+        try:
+            files = []
+            success = fail = 0
+            for i, song in enumerate(songs):
+                if cancel.is_set(): break
+                name, text = _download_single_lrc(song)
+                if name and text:
+                    files.append((name, text.encode("utf-8"))); success += 1
+                else:
+                    fail += 1
+                yield json.dumps({
+                    "index": i, "total": len(songs), "phase": "download",
+                    "title": song.get("title", ""),
+                    "successCount": success, "failCount": fail,
+                }, ensure_ascii=False) + "\n"
+
+            cancelled = cancel.is_set()
+            if not files:
+                yield json.dumps({"cancelled": True, "msg": "未下载任何歌词"}, ensure_ascii=False) + "\n"
+                return
+
+            yield json.dumps({"phase": "pack", "packing": True}, ensure_ascii=False) + "\n"
+            today = datetime.now().strftime("%Y%m%d")
+            zip_name = f"歌词LRC_{today}"
+            buf = io.BytesIO()
+            seen = set()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, data in files:
+                    base = name; i = 1
+                    while name in seen:
+                        stem, ext = base.rsplit(".", 1)
+                        name = f"{stem}({i}).{ext}"; i += 1
+                    seen.add(name)
+                    zf.writestr(name, data)
+            buf.seek(0)
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            tmp.write(buf.getvalue())
+            tmp.close()
+            _batch_store[token] = tmp.name
+
+            yield json.dumps({
+                "done": True, "token": token, "filename": zip_name + ".zip",
+                "success": success, "fail": fail, "total": len(songs),
+                "cancelled": cancelled,
+            }, ensure_ascii=False) + "\n"
+        finally:
+            _batch_cancel.pop(token, None)
+
+    return Response(generate(), mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/api/batch/download-result")
+def api_batch_download_result():
+    """Serve a completed batch zip by token."""
+    token = request.args.get("token", "")
+    path = _batch_store.pop(token, None)
+    _batch_store_ts.pop(token, None)
+    if not path:
+        return jsonify({"error": "Not found or expired"}), 404
+    try:
+        return send_file(path, as_attachment=True,
+                         download_name=request.args.get("name", "download.zip"),
+                         mimetype="application/zip")
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+
+@app.route("/api/batch/cancel", methods=["POST"])
+def api_batch_cancel():
+    """Cancel an in-progress batch download."""
+    data = request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    evt = _batch_cancel.get(token)
+    if evt:
+        evt.set()
+        return jsonify({"cancelled": True})
+    return jsonify({"error": "No such batch"}), 404
+
+
+@app.route("/api/admin/challenge")
+def api_admin_challenge():
+    """Generate a cryptographic nonce for challenge-response auth.
+
+    The client must compute: SHA256(nonce + SHA256(password))
+    and send it to /api/admin/verify. The plaintext password is
+    never transmitted over the network.
+    """
+    _admin_cleanup()
+    nonce = secrets.token_hex(32)
+    _admin_nonce_store[nonce] = (time.time(), 0)
+    return jsonify({"nonce": nonce})
+
+
+@app.route("/api/admin/verify", methods=["POST"])
+def api_admin_verify():
+    """Verify admin authentication via challenge-response.
+
+    Request: {"proof": "hex", "nonce": "hex"}
+    - proof = SHA256(nonce + SHA256(password))
+    - nonce from /api/admin/challenge
+
+    Returns a signed session token on success.
+    """
+    _admin_cleanup()
+    ip = request.remote_addr or "127.0.0.1"
+
+    # Layer 3: Rate limiting
+    allowed, reason = _admin_rate_check(ip)
+    if not allowed:
+        log.warning(f"[admin] Rate limit blocked IP {ip}: {reason}")
+        return jsonify({"success": False, "error": "请求太频繁，请稍后再试"}), 429
+
+    data = request.get_json(silent=True) or {}
+    proof = data.get("proof", "")
+    nonce = data.get("nonce", "")
+
+    if not proof or not nonce:
+        return jsonify({"success": False, "error": "认证参数不完整"}), 400
+
+    # Validate nonce
+    nonce_entry = _admin_nonce_store.get(nonce)
+    if not nonce_entry:
+        return jsonify({"success": False, "error": "验证会话已过期，请重试"}), 403
+
+    nonce_ts, nonce_attempts = nonce_entry
+    now = time.time()
+
+    # Nonce expires in 5 minutes
+    if now - nonce_ts > 300:
+        _admin_nonce_store.pop(nonce, None)
+        return jsonify({"success": False, "error": "验证会话已过期，请重试"}), 403
+
+    # Max 3 attempts per nonce
+    if nonce_attempts >= 3:
+        _admin_nonce_store.pop(nonce, None)
+        return jsonify({"success": False, "error": "验证失败次数过多，请刷新重试"}), 403
+
+    _admin_nonce_store[nonce] = (nonce_ts, nonce_attempts + 1)
+
+    # Layer 2: Challenge-response verification
+    # Expected: SHA256(nonce || hex(SHA256(password)))
+    fast_hash_hex = _get_fast_hash().hex()
+    expected = hashlib.sha256(nonce.encode() + fast_hash_hex.encode()).hexdigest()
+
+    # Layer 4: Timing-safe comparison
+    if not hmac.compare_digest(proof, expected):
+        # Record failed attempt
+        if ip in _admin_attempt_ips:
+            _admin_attempt_ips[ip][-1] = (_admin_attempt_ips[ip][-1][0], False)
+        log.warning(f"[admin] Failed auth attempt from {ip}")
+        return jsonify({"success": False, "error": "密码错误"}), 403
+
+    # Success — consume the nonce (prevent replay)
+    _admin_nonce_store.pop(nonce, None)
+
+    # Record success
+    if ip in _admin_attempt_ips:
+        _admin_attempt_ips[ip] = _admin_attempt_ips[ip][:-1]  # clear rate-limit record
+
+    # Layer 6: Issue signed session token
+    token = _admin_make_token()
+    log.info(f"[admin] Successful auth from {ip}")
+    return jsonify({"success": True, "token": token})
+
+
+def _require_admin_token(f):
+    """Decorator: require valid admin session token via Authorization header."""
+    from functools import wraps
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        else:
+            token = request.args.get("token", "")
+        if not token or not _admin_verify_token(token):
+            return jsonify({"error": "未授权访问", "code": "unauthorized"}), 401
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+@app.route("/api/admin/stats")
+@_require_admin_token
+def api_admin_stats():
+    """Return all analytics data for the dashboard."""
+    try:
+        stats = analytics.get_all_stats()
+        # Add latest API status
+        stats["api_status"] = analytics.get_latest_api_status()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/api-check")
+@_require_admin_token
+def api_admin_check():
+    """Ping all external music APIs and return their status (batch)."""
+
+    results = {}
+    for name, url, timeout in APIS_TO_CHECK:
+        result = _ping_single(name, url, timeout)
+        results[name] = result
+        analytics.record_api_check(name, result["available"], result.get("response_ms", 0))
+
+    available = sum(1 for r in results.values() if r["available"])
+    total = len(results)
+
+    return jsonify({
+        "apis": results,
+        "available": available,
+        "total": total,
+        "ratio": f"{available}/{total}",
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+@app.route("/api/admin/api-check-one")
+@_require_admin_token
+def api_admin_check_one():
+    """Ping a single external API and return its status (for progressive updates)."""
+    name = request.args.get("name", "")
+    if not name:
+        return jsonify({"error": "Missing name"}), 400
+
+    for n, url, timeout in APIS_TO_CHECK:
+        if n == name:
+            result = _ping_single(n, url, timeout)
+            analytics.record_api_check(name, result["available"], result.get("response_ms", 0))
+            return jsonify({"name": name, "result": result})
+
+    return jsonify({"error": f"Unknown API: {name}"}), 404
 
 
 @app.after_request

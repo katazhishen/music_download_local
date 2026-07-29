@@ -403,17 +403,15 @@ class NeteaseAPI:
         """Get all songs in a playlist.
 
         .. note::
-            For playlists with >1000 songs, only the first 1000 are returned
-            by the API.  Use pagination with ``offset`` if needed.
+            For playlists with >1000 songs, NetEase may cap the response.
+            Use pagination with ``offset`` if needed.
         """
         if self._api.using_custom_api:
-            # Proxy servers usually expose playlist endpoints directly
             resp = await self._api._get_json(
-                "/api/playlist/detail", {"id": playlist_id}
+                "/api/playlist/detail", {"id": playlist_id, "limit": 2000}
             )
             playlist = resp.get("playlist", resp.get("result", {}))
         else:
-            # Use weapi (more reliable within China)
             try:
                 resp = await self._api._post_weapi(
                     "/weapi/v6/playlist/detail",
@@ -421,9 +419,8 @@ class NeteaseAPI:
                 )
                 playlist = resp.get("playlist", {})
             except Exception:
-                # Fallback to public API
                 resp = await self._api._get_json(
-                    "/api/playlist/detail", {"id": playlist_id}
+                    "/api/playlist/detail", {"id": playlist_id, "limit": 2000}
                 )
                 playlist = resp.get("result", {})
 
@@ -431,10 +428,16 @@ class NeteaseAPI:
         return [_parse_song_summary(t) for t in tracks]
 
     def get_playlist_sync(self, playlist_id: str) -> list[SongInfo]:
-        """Synchronous playlist fetch."""
+        """Synchronous playlist fetch.
+
+        Fetches all tracks via weapi (n=100000).  Falls back to public API
+        with limit=2000 if weapi fails.  Note: NetEase caps at ~1000 tracks
+        per request; for playlists larger than that, use pagination with
+        the ``offset`` parameter.
+        """
         if self._api.using_custom_api:
             resp = self._api._get_json_sync(
-                "/api/playlist/detail", {"id": playlist_id}
+                "/api/playlist/detail", {"id": playlist_id, "limit": 2000}
             )
             playlist = resp.get("playlist", resp.get("result", {}))
         else:
@@ -445,8 +448,9 @@ class NeteaseAPI:
                 )
                 playlist = resp.get("playlist", {})
             except Exception:
+                # Fallback to public API — try with a generous limit
                 resp = self._api._get_json_sync(
-                    "/api/playlist/detail", {"id": playlist_id}
+                    "/api/playlist/detail", {"id": playlist_id, "limit": 2000}
                 )
                 playlist = resp.get("result", {})
 
