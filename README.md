@@ -1,7 +1,8 @@
 ---
 title: 卡塔音乐
 emoji: 🎵
-colorFrom: blue
+colorFrom: blue![Uploading 屏幕截图 2026-09-15 142741.png…]()
+
 colorTo: green
 sdk: docker
 app_port: 7860
