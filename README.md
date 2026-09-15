@@ -10,6 +10,8 @@ pinned: false
 
 # 卡塔音乐（Kata Music）
 
+网页版：https://soliar-katamusic.hf.space/
+
 聚合网易云 / QQ 音乐 / 酷狗 / 酷我 / 咪咕等多平台的音乐搜索与下载 Web 应用（Flask + Waitress）。
 
 ## 部署到 Hugging Face Spaces
