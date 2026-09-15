@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+_packages/
+.env
+venv/
+data/*.db
+Downloads/
+downloads/
+*.mp3
+*.flac
+*.ncm
+.claude/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 本地虚拟环境（构建镜像时会重新 pip install）
+venv/
+.venv/
+
+# 运行时数据（不要打包本地 analytics.db，含真实访客/下载数据）
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+
+# 本地下载缓存 / 临时产物
+Downloads/
+downloads/
+*.mp3
+*.flac
+*.ncm
+
+# 开发辅助
+.claude/
+_packages/
+.env
+.git/
+.gitignore
+CLAUDE.md
+
+# 系统杂项
+.DS_Store
+Thumbs.db
