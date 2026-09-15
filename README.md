@@ -14,7 +14,8 @@ pinned: false
 
 聚合网易云 / QQ 音乐 / 酷狗 / 酷我 / 咪咕等多平台的音乐搜索与下载 Web 应用（Flask + Waitress）。
 
-![Uploading image.png…]()
+![Uploading 屏幕截图 2026-09-15 142741.png…]()
+
 
 
 ## 部署到 Hugging Face Spaces
