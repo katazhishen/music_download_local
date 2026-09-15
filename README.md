@@ -14,6 +14,9 @@ pinned: false
 
 聚合网易云 / QQ 音乐 / 酷狗 / 酷我 / 咪咕等多平台的音乐搜索与下载 Web 应用（Flask + Waitress）。
 
+![Uploading image.png…]()
+
+
 ## 部署到 Hugging Face Spaces
 
 1. 在 [huggingface.co/new-space](https://huggingface.co/new-space) 新建 Space，SDK 选 **Docker**（或直接 push 本仓库，README 顶部的 `sdk: docker` 会自动识别）。
